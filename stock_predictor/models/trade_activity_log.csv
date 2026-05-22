@@ -1,0 +1,15 @@
+logged_at,event,symbol,amount_usd,qty,predicted_gain_pct,buying_power_before,notes
+2026-05-06T22:04:46,OPEN_BUY,CHKP,202677.84,1669.764,0.2885710299015045,203696.32,amount_usd=planlagt købsbudget (buying_power − reserve); faktisk udfyldelse kan afvige
+2026-05-07T13:38:48,OPEN_BUY,EQNR,202674.04,5163.07,1.7333415746688843,203692.5,amount_usd=planlagt købsbudget (buying_power − reserve); faktisk udfyldelse kan afvige
+2026-05-07T16:56:13,OPEN_BUY,META,12929.53,20.449,1.1526657342910767,12994.5,amount_usd=planlagt købsbudget (buying_power − reserve); faktisk udfyldelse kan afvige
+2026-05-08T14:14:13,OPEN_BUY,META,410334.78,644.825,1.1526768207550049,412396.76,amount_usd=planlagt købsbudget (buying_power − reserve); faktisk udfyldelse kan afvige
+2026-05-12T14:04:51,OPEN_BUY,NICE,95055.51,1007.298,0.3352854251861572,95533.18,382132.72,382132.72,191066.36,95533.18,"amount_usd=planlagt købsbudget (broker-loft − reserve); loft=min(cash,BP[,DTBP eller RegT+NMBP])"
+2026-05-15T17:45:12,OPEN_BUY,NICE,91457.23,1006.998,0.3835980296134949,91916.81,367667.24,367667.24,183833.62,91916.81,"amount_usd=planlagt købsbudget (broker-loft − reserve); loft=min(cash,BP[,DTBP eller RegT+NMBP])"
+2026-05-18T18:16:46,OPEN_BUY,NICE,93230.52,1006.283,0.2863449156284332,93699.02,374796.08,374796.08,187398.04,93699.02,"amount_usd=planlagt købsbudget (broker-loft − reserve); loft=min(cash,BP[,DTBP eller RegT+NMBP])"
+2026-05-18T18:23:29,OPEN_BUY,NICE,93070.33,1004.554,0.2863449156284332,93538.02,374796.08,374796.08,187076.04,93538.02,"amount_usd=planlagt købsbudget (broker-loft − reserve); loft=min(cash,BP[,DTBP eller RegT+NMBP])"
+2026-05-18T18:26:33,OPEN_BUY,NICE,92910.4,1002.827,0.2863449156284332,93377.29,374796.08,374796.08,186754.58,93377.29,"amount_usd=planlagt købsbudget (broker-loft − reserve); loft=min(cash,BP[,DTBP eller RegT+NMBP])"
+2026-05-18T18:27:13,OPEN_BUY,NICE,92660.95,1000.135,0.2863449156284332,93126.58,374796.08,374796.08,186253.16,93126.58,"amount_usd=planlagt købsbudget (broker-loft − reserve); loft=min(cash,BP[,DTBP eller RegT+NMBP])"
+2026-05-18T18:28:24,OPEN_BUY,NICE,92412.17,997.45,0.2863449156284332,92876.55,374796.08,374796.08,185753.1,92876.55,"amount_usd=planlagt købsbudget (broker-loft − reserve); loft=min(cash,BP[,DTBP eller RegT+NMBP])"
+2026-05-19T07:31:28,OPEN_BUY,NICE,91935.78,965.422,0.27511417865753174,92397.77,374796.08,374796.08,184795.54,92397.77,"amount_usd=planlagt købsbudget (broker-loft − reserve); loft=min(cash,BP[,DTBP eller RegT+NMBP])"
+2026-05-20T23:03:46,OPEN_BUY,NICE,91999.91,940.908,0.26340654492378235,92462.22,369848.88,369848.88,184924.44,92462.22,"amount_usd=planlagt købsbudget (broker-loft − reserve); loft=min(cash,BP[,DTBP eller RegT+NMBP])"
+2026-05-22T15:49:16,OPEN_BUY,NICE,93750.61,952.429,0.2571481466293335,94221.72,268588.39,268588.39,188443.44,49283.95,"amount_usd=planlagt købsbudget (broker-loft − reserve); loft=min(cash,BP[,DTBP eller RegT+NMBP])"
