@@ -18,7 +18,7 @@ class TestWatchlistMetrics(unittest.TestCase):
 
 
 class TestFeaturePipeline(unittest.TestCase):
-    def test_engineer_features_has_15_columns(self) -> None:
+    def test_engineer_features_has_21_columns(self) -> None:
         from pathlib import Path
 
         import pandas as pd
@@ -32,7 +32,7 @@ class TestFeaturePipeline(unittest.TestCase):
         df = pd.read_parquet(pq)
         feats = engineer_features(df)
         self.assertEqual(len(feats.columns), int(config.N_FEATURES))
-        self.assertEqual(int(config.N_FEATURES), 15)
+        self.assertEqual(int(config.N_FEATURES), 21)
 
     def test_lstm_accepts_n_features(self) -> None:
         import torch

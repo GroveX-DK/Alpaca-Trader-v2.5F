@@ -116,13 +116,15 @@ def _read_cache_parquet(path: Path) -> Optional[pd.DataFrame]:
             if col not in df.columns:
                 return None
         cols = ["open", "high", "low", "close", "volume"]
-        if "vol_annual_pct" in df.columns:
-            cols.append("vol_annual_pct")
+        for opt in ("vol_annual_pct", "vix_close"):
+            if opt in df.columns:
+                cols.append(opt)
         out = df[cols].copy()
         for c in ("open", "high", "low", "close", "volume"):
             out[c] = out[c].astype(float)
-        if "vol_annual_pct" in out.columns:
-            out["vol_annual_pct"] = out["vol_annual_pct"].astype(float)
+        for opt in ("vol_annual_pct", "vix_close"):
+            if opt in out.columns:
+                out[opt] = out[opt].astype(float)
         return out
     except Exception as exc:  # noqa: BLE001
         logger.warning("Kunne ikke læse cache %s: %s", path, exc)

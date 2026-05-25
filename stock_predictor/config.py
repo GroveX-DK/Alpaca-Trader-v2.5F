@@ -18,87 +18,226 @@ BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 # Alpaca/IEX:    kun US-noteringer (NYSE/NASDAQ). Lokale tickere (fx VOLV-B, 005930, PETR4)
 # understøttes ikke — erstattet hvor US-ticker er entydig; ellers fjernet.
 WATCHLIST = [
-    "AAPL",
-    "NVDA",
-    "TSLA",
-    "MSFT",
-    "AMD",
-    "META",
-    "GOOGL",
-    "AMZN",
-    "BAC",
-    "COST",
-    "CRM",
-    "CVX",
-    "GS",
-    "HD",
-    "INTC",
-    "JNJ",
-    "JPM",
-    "KO",
-    "LMT",
-    "MA",
-    "NEE",
-    "PFE",
-    "PG",
-    "UNH",
-    "V",
-    "WMT",
-    "XOM",
-    "ABBV",
-    "AMT",
-    "AMX",
-    "ASML",
-    "AZN",
-    "BABA",
-    "BP",
-    "BHP",
-    "BUD",
-    "CHKP",
-    "CNI",
-    "EQNR",
-    "ERIC",
-    "FMX",
-    "HDB",
-    "HSBC",
-    "INFY",
-    "ITUB",
-    "MUFG",
-    "NICE",
-    "NOK",
-    "NVO",
-    "NVS",
-    "PBR",
-    "RIO",
-    "RY",
-    "SAN",
-    "SAP",
-    "SHEL",
-    "SHOP",
-    "SONY",
-    "SU",
-    "TD",
-    "TM",
-    "UL",
-    "VALE",
-    "WIT",
-    "TSM",
-    "SQM",
-    "TCEHY",
-    "SFTBY",
-    "ATLKY",
-    "CABGY",
-    "AMKBY",
-    "VLVLY",
-    "WEGZY",
-    "DBSDY",
-    "SINGY",
-    "SGAPY",
+    # === INFORMATION TECHNOLOGY (35) ===
+    "AAPL",   # Apple
+    "MSFT",   # Microsoft
+    "NVDA",   # Nvidia
+    "AVGO",   # Broadcom
+    "ORCL",   # Oracle
+    "CRM",    # Salesforce
+    "ADBE",   # Adobe
+    "AMD",    # Advanced Micro Devices
+    "QCOM",   # Qualcomm
+    "TXN",    # Texas Instruments
+    "AMAT",   # Applied Materials
+    "MU",     # Micron Technology
+    "INTC",   # Intel
+    "LRCX",   # Lam Research
+    "KLAC",   # KLA Corporation
+    "ADI",    # Analog Devices
+    "NOW",    # ServiceNow
+    "INTU",   # Intuit
+    "PANW",   # Palo Alto Networks
+    "FTNT",   # Fortinet
+    "CDNS",   # Cadence Design Systems
+    "SNPS",   # Synopsys
+    "ACN",    # Accenture
+    "IBM",    # IBM
+    "DELL",   # Dell Technologies
+    "HPQ",    # HP Inc
+    "HPE",    # Hewlett Packard Enterprise
+    "MRVL",   # Marvell Technology
+    "PLTR",   # Palantir
+    "CRWD",   # CrowdStrike
+    "NET",    # Cloudflare
+    "WDAY",   # Workday
+    "SNOW",   # Snowflake
+    "TEAM",   # Atlassian
+    "ZS",     # Zscaler
+
+    # === FINANCIALS (35) ===
+    "BRK-B",  # Berkshire Hathaway
+    "JPM",    # JPMorgan Chase
+    "BAC",    # Bank of America
+    "WFC",    # Wells Fargo
+    "GS",     # Goldman Sachs
+    "MS",     # Morgan Stanley
+    "C",      # Citigroup
+    "BLK",    # BlackRock
+    "SCHW",   # Charles Schwab
+    "AXP",    # American Express
+    "V",      # Visa
+    "MA",     # Mastercard
+    "SPGI",   # S&P Global
+    "MCO",    # Moody's
+    "CB",     # Chubb
+    "PGR",    # Progressive
+    "MET",    # MetLife
+    "PRU",    # Prudential Financial
+    "ALL",    # Allstate
+    "TRV",    # Travelers
+    "USB",    # US Bancorp
+    "PNC",    # PNC Financial
+    "TFC",    # Truist Financial
+    "COF",    # Capital One
+    "ICE",    # Intercontinental Exchange
+    "CME",    # CME Group
+    "MSCI",   # MSCI Inc
+    "FIS",    # Fidelity National Info
+    "FISV",   # Fiserv
+    "PYPL",   # PayPal
+    "XYZ",    # Block (tidl. SQ; omdøbt 2025)
+    "AIG",    # AIG
+    "HIG",    # Hartford Financial
+    "AFL",    # Aflac
+    "RJF",    # Raymond James
+
+    # === HEALTH CARE (30) ===
+    "LLY",    # Eli Lilly
+    "UNH",    # UnitedHealth
+    "JNJ",    # Johnson & Johnson
+    "ABBV",   # AbbVie
+    "MRK",    # Merck
+    "TMO",    # Thermo Fisher Scientific
+    "ABT",    # Abbott Laboratories
+    "DHR",    # Danaher
+    "PFE",    # Pfizer
+    "AMGN",   # Amgen
+    "GILD",   # Gilead Sciences
+    "BMY",    # Bristol-Myers Squibb
+    "CVS",    # CVS Health
+    "CI",     # Cigna
+    "ELV",    # Elevance Health
+    "HUM",    # Humana
+    "MDT",    # Medtronic
+    "BSX",    # Boston Scientific
+    "SYK",    # Stryker
+    "ZTS",    # Zoetis
+    "ISRG",   # Intuitive Surgical
+    "REGN",   # Regeneron
+    "VRTX",   # Vertex Pharmaceuticals
+    "BIIB",   # Biogen
+    "IQV",    # IQVIA
+    "BDX",    # Becton Dickinson
+    "IDXX",   # IDEXX Laboratories
+    "RMD",    # ResMed
+    "DXCM",   # Dexcom
+    "A",      # Agilent Technologies
+
+    # === COMMUNICATION SERVICES (19) ===
+    "META",   # Meta Platforms
+    "GOOGL",  # Alphabet (Google)
+    "NFLX",   # Netflix
+    "DIS",    # Walt Disney
+    "CMCSA",  # Comcast
+    "T",      # AT&T
+    "VZ",     # Verizon
+    "TMUS",   # T-Mobile
+    "CHTR",   # Charter Communications
+    "SNAP",   # Snap
+    "PINS",   # Pinterest
+    "WBD",    # Warner Bros. Discovery
+    "PSKY",   # Paramount Skydance (tidl. PARA; fusioneret 2025)
+    "LYV",    # Live Nation
+    "EA",     # Electronic Arts
+    "TTWO",   # Take-Two Interactive
+    "SPOT",   # Spotify
+    "OMC",    # Omnicom Group (overtog IPG 2025)
+    "FOXA",   # Fox Corporation
+
+    # === ENERGY (19) ===
+    "XOM",    # ExxonMobil
+    "CVX",    # Chevron
+    "COP",    # ConocoPhillips
+    "EOG",    # EOG Resources
+    "SLB",    # SLB (Schlumberger)
+    "MPC",    # Marathon Petroleum
+    "PSX",    # Phillips 66
+    "VLO",    # Valero Energy
+    "OXY",    # Occidental Petroleum
+    "HAL",    # Halliburton
+    "BKR",    # Baker Hughes
+    "DVN",    # Devon Energy
+    "FANG",   # Diamondback Energy
+    "KMI",    # Kinder Morgan
+    "WMB",    # Williams Companies
+    "OKE",    # ONEOK
+    "LNG",    # Cheniere Energy
+    "TRGP",   # Targa Resources
+    "APA",    # APA Corporation
+
+    # === CONSUMER STAPLES (15) ===
+    "PG",     # Procter & Gamble
+    "KO",     # Coca-Cola
+    "PEP",    # PepsiCo
+    "PM",     # Philip Morris
+    "MO",     # Altria Group
+    "COST",   # Costco
+    "WMT",    # Walmart
+    "MDLZ",   # Mondelez
+    "KHC",    # Kraft Heinz
+    "GIS",    # General Mills
+    "CL",     # Colgate-Palmolive
+    "KMB",    # Kimberly-Clark
+    "EL",     # Estée Lauder
+    "TSN",    # Tyson Foods
+    "SYY",    # Sysco
+
+    # === CONSUMER DISCRETIONARY (20) ===
+    "AMZN",   # Amazon
+    "TSLA",   # Tesla
+    "MCD",    # McDonald's
+    "NKE",    # Nike
+    "SBUX",   # Starbucks
+    "HD",     # Home Depot
+    "LOW",    # Lowe's
+    "TJX",    # TJX Companies
+    "BKNG",   # Booking Holdings
+    "MAR",    # Marriott International
+    "HLT",    # Hilton Worldwide
+    "GM",     # General Motors
+    "F",      # Ford Motor
+    "ABNB",   # Airbnb
+    "RCL",    # Royal Caribbean
+    "CMG",    # Chipotle
+    "PHM",    # PulteGroup
+    "DHI",    # D.R. Horton
+    "ORLY",   # O'Reilly Auto Parts
+    "AZO",    # AutoZone
+
+    # === INDUSTRIALS (15) ===
+    "GE",     # GE Aerospace
+    "RTX",    # RTX Corporation (Raytheon)
+    "HON",    # Honeywell
+    "LMT",    # Lockheed Martin
+    "NOC",    # Northrop Grumman
+    "BA",     # Boeing
+    "CAT",    # Caterpillar
+    "DE",     # John Deere
+    "UPS",    # UPS
+    "FDX",    # FedEx
+    "UNP",    # Union Pacific
+    "ETN",    # Eaton
+    "EMR",    # Emerson Electric
+    "ITW",    # Illinois Tool Works
+    # === MATERIALS (5) ===
+    "LIN",    # Linde
+    "SHW",    # Sherwin-Williams
+    "FCX",    # Freeport-McMoRan
+    "NEM",    # Newmont
+    "ECL",    # Ecolab
+
+    # === UTILITIES (5) ===
+    "NEE",    # NextEra Energy
+    "SO",     # Southern Company
+    "DUK",    # Duke Energy
+    "D",      # Dominion Energy
+    "EXC",    # Exelon
 ]
 
 # LSTM-sekvenslængde i handelsdage (skal matche checkpoint seq_len; gen-træn ved ændring)
 LOOKBACK_DAYS = 600
-SEQ_LEN = LOOKBACK_DAYS
+SEQ_LEN = 1100
 
 # Ekstra kalenderdages buffer ved API/cache-hentning
 FETCH_EXTRA_DAYS = 60
@@ -120,21 +259,21 @@ INFERENCE_FETCH_CALENDAR_DAYS = (
 # Træningsvinduer
 TRAINING_YEARS = 5
 # Antal kolonner fra engineer_features; ændres ved nye features — gen-træn og kassér gamle lstm_stock.pt + feature_scaler.joblib.
-N_FEATURES = 15
+N_FEATURES = 21
 
 # Watchlist-CSV (OHLCV + ekstra kolonner) til cache-import
 WATCHLIST_CSV_DIR = _PROJECT_ROOT / "output" / "Watchlist"
 
 # Model (lettere / hurtigere CPU: fx LSTM_HIDDEN=128, LSTM_LAYERS=2)
 LSTM_HIDDEN = 128
-LSTM_LAYERS = 2
+LSTM_LAYERS = 3
 DROPOUT = 0.2
 LR = 1e-4   
-EPOCHS = 100
+EPOCHS = 100000
 BATCH_SIZE = 32
 WEIGHT_DECAY = 1e-5
 VAL_RATIO = 0.25
-EARLY_STOP_PATIENCE = 5
+EARLY_STOP_PATIENCE = 4
 SAVE_MODEL_ONLY_IF_BETTER_THAN_DISK = True
 CACHE_DIR = _PKG_ROOT / "cache"
 OHLCV_CACHE_ENABLED = True

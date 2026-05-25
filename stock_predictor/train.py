@@ -333,14 +333,24 @@ def train_model() -> None:
 
             if X_v is not None and Y_v is not None:
                 model.eval()
+                # Batchet val-forward: hele val-sættet i ét kald sprænger RAM
+                # (aktiveringer ~ N*seq_len*hidden). Akkumulér vægtet MSE i chunks.
+                val_bs = max(1, int(getattr(cfg, "VAL_BATCH_SIZE", cfg.BATCH_SIZE)))
+                n_val = X_v.size(0)
+                sse = 0.0
                 with torch.no_grad():
-                    if use_amp and device.type == "cuda":
-                        with torch.amp.autocast("cuda"):
-                            vp = model(X_v)
-                            vloss = float(criterion(vp, Y_v).item())
-                    else:
-                        vp = model(X_v)
-                        vloss = float(criterion(vp, Y_v).item())
+                    for vi in range(0, n_val, val_bs):
+                        xv = X_v[vi : vi + val_bs]
+                        yv = Y_v[vi : vi + val_bs]
+                        if use_amp and device.type == "cuda":
+                            with torch.amp.autocast("cuda"):
+                                vp = model(xv)
+                                bloss = float(criterion(vp, yv).item())
+                        else:
+                            vp = model(xv)
+                            bloss = float(criterion(vp, yv).item())
+                        sse += bloss * xv.size(0)
+                vloss = sse / max(1, n_val)
 
                 if lr_sched_enabled and scheduler is not None:
                     scheduler.step(vloss)
