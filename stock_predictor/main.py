@@ -22,6 +22,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from stock_predictor.backtest import plot_saved_backtest, run_backtest  # noqa: E402
 from stock_predictor.predict import predict_rankings  # noqa: E402
 from stock_predictor.train import train_model  # noqa: E402
 from stock_predictor.trader import rotate_to_symbol  # noqa: E402
@@ -54,6 +55,27 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             "Lukker gammel papirposition og køber stærkeste ticker."
         ),
     )
+    grp.add_argument(
+        "--backtest",
+        action="store_true",
+        help=(
+            "Backtest strategien over kalenderåret 2025 fra disk-cache (offline). "
+            "Simulerer dag-for-dag, gemmer output/backtest_2025.csv og viser en pop op-graf "
+            "med equity-kurve (start 100.000) + buy & hold-benchmark."
+        ),
+    )
+    grp.add_argument(
+        "--show-backtest",
+        type=int,
+        metavar="ÅR",
+        nargs="?",
+        const=2025,
+        help=(
+            "Genåbn grafen for en tidligere gemt backtest (output/backtest_<ÅR>.csv) uden "
+            "at køre simuleringen igen. SPY buy & hold-benchmark hentes live på ny. "
+            "Standard-år er 2025."
+        ),
+    )
     p.add_argument("--verbose", "-v", action="store_true", help="Udvid debug-log.")
     return p.parse_args(argv)
 
@@ -64,6 +86,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.train:
         train_model()
+        return 0
+
+    if args.backtest:
+        run_backtest()
+        return 0
+
+    if args.show_backtest is not None:
+        plot_saved_backtest(args.show_backtest)
         return 0
 
     best_sym, score, ranking = predict_rankings()

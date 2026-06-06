@@ -85,6 +85,7 @@ def predict_rankings() -> Tuple[str, float, List[Tuple[str, float]]]:
         config.WATCHLIST,
         lookback_calendar_days=calendar_days,
         extra_buffer_days=0,
+        prefer_cache_only=False,
     )
     bars = fetch_result.bars
     if not bars:

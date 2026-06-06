@@ -15,7 +15,7 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 from stock_predictor import config
-from stock_predictor.feature_engineer import rolling_annualized_log_vol_pct
+from stock_predictor.feature_engineer import build_dataset_frame, rolling_annualized_log_vol_pct
 from stock_predictor.watchlist_metrics import compute_watchlist_metrics
 
 logger = logging.getLogger(__name__)
@@ -96,6 +96,21 @@ def _enrich_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     return _with_vol_annual_pct(compute_watchlist_metrics(df))
+
+
+def _dataset_for_cache(enriched: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fuldt cache-datasæt der skrives til Parquet: OHLCV + Watchlist-metriker +
+    vol_annual_pct + vix_close (ffill) + alle stationære features (FEATURE_COLUMNS).
+
+    Sikrer at de stationære feature-kolonner forbliver materialiseret i cachen efter
+    inkrementel tail/backfill (ellers ville et gem via _enrich_ohlcv tabe dem). Nye barer
+    uden frisk ^VIX arver seneste kendte vix_close via ffill i build_dataset_frame.
+    """
+    if enriched.empty:
+        return enriched
+    vix = enriched["vix_close"] if "vix_close" in enriched.columns else None
+    return build_dataset_frame(enriched, vix)
 
 
 def _read_cache_parquet(path: Path) -> Optional[pd.DataFrame]:
@@ -255,7 +270,7 @@ def _merge_trim_save_symbol(
         merged = trim(full)
         if not merged.empty:
             try:
-                _atomic_save_parquet(full, path)
+                _atomic_save_parquet(_dataset_for_cache(full), path)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Kunne ikke skrive cache for %s: %s", symbol, exc)
         return merged if not merged.empty else None
@@ -276,7 +291,8 @@ def _merge_trim_save_symbol(
 
     if _ts(cmax) < req_end_ts:
         tail_start = (_ts(cmax) + pd.Timedelta(days=1)).date()
-        right = _fetch_symbol_range(client, symbol, tail_start, req_end)
+        # Alpaca treats `end` as exclusive, so pass want_end (today) to include req_end's bars.
+        right = _fetch_symbol_range(client, symbol, tail_start, want_end)
         if right is None:
             logger.warning("Tail-api fejlede for %s — bruger cache til sidste kendte bar.", symbol)
         elif not right.empty:
@@ -288,7 +304,7 @@ def _merge_trim_save_symbol(
     merged_full = _enrich_ohlcv(merged)
 
     try:
-        _atomic_save_parquet(merged_full, path)
+        _atomic_save_parquet(_dataset_for_cache(merged_full), path)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Kunne ikke opdatere cache for %s: %s", symbol, exc)
 

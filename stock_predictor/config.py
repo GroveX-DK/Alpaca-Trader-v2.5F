@@ -56,7 +56,7 @@ WATCHLIST = [
     "ZS",     # Zscaler
 
     # === FINANCIALS (35) ===
-    "BRK-B",  # Berkshire Hathaway
+    "BRK.B",  # Berkshire Hathaway
     "JPM",    # JPMorgan Chase
     "BAC",    # Bank of America
     "WFC",    # Wells Fargo
@@ -237,7 +237,7 @@ WATCHLIST = [
 
 # LSTM-sekvenslængde i handelsdage (skal matche checkpoint seq_len; gen-træn ved ændring)
 LOOKBACK_DAYS = 600
-SEQ_LEN = 1100
+SEQ_LEN = LOOKBACK_DAYS
 
 # Ekstra kalenderdages buffer ved API/cache-hentning
 FETCH_EXTRA_DAYS = 60
@@ -258,7 +258,10 @@ INFERENCE_FETCH_CALENDAR_DAYS = (
 
 # Træningsvinduer
 TRAINING_YEARS = 5
-# Antal kolonner fra engineer_features; ændres ved nye features — gen-træn og kassér gamle lstm_stock.pt + feature_scaler.joblib.
+# Antal kolonner fra engineer_features. Features er stationære/skalainvariante
+# (log-afkast, intradag-ratios, volumen-delta + relative indikatorer). Antallet er
+# uændret 21, men betydningen skiftede — gamle lstm_stock.pt + feature_scaler.joblib
+# er kasseret; gen-træn med --train før --run.
 N_FEATURES = 21
 
 # Watchlist-CSV (OHLCV + ekstra kolonner) til cache-import
@@ -272,6 +275,7 @@ LR = 1e-4
 EPOCHS = 100000
 BATCH_SIZE = 32
 WEIGHT_DECAY = 1e-5
+HUBER_DELTA = 1.0
 VAL_RATIO = 0.25
 EARLY_STOP_PATIENCE = 4
 SAVE_MODEL_ONLY_IF_BETTER_THAN_DISK = True

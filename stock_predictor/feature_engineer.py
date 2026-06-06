@@ -1,16 +1,20 @@
 """Tekniske indikatorer, kalender- og makrofeatures pr. aktie-pr. dag.
 
-Featuresæt (21 kolonner, beregnes fra OHLCV med ren pandas + ^VIX):
+Featuresæt (21 kolonner, beregnes fra OHLCV med ren pandas + ^VIX). Alle pris-
+afledte features er gjort *stationære / skalainvariante* (ændring frem for niveau),
+så modellen generaliserer på tværs af aktier og tidsperioder uden data-leakage fra
+absolutte prisniveauer.
 
-Tekniske indikatorer:
-    rsi_14, macd, macd_signal, macd_hist, bb_upper, bb_lower, bb_width,
-    ema_20, ema_50, obv, stoch_k, cci_20
+Tekniske indikatorer (skalainvariante):
+    rsi_14, macd_norm, macd_signal_norm, macd_hist_norm, bb_upper_rel, bb_lower_rel,
+    bb_width_rel, ema_20_rel, ema_50_rel, obv_delta, stoch_k, cci_20
 Kalender (fra dato-index):
     day_of_week, month
 Makro (fra yfinance ^VIX, gemt som kolonne vix_close i cache):
     vix_close
-Rå OHLCV + volatilitet (alle kolonner fra cache-parquet):
-    open, high, low, close, volume, vol_annual_pct
+Afkast / bar-form / volatilitet (afledt af OHLCV):
+    log_ret = ln(C_t/C_{t-1}), high_ratio = H/O, low_ratio = L/O, close_ratio = C/O,
+    vol_delta = ln(V_t/V_{t-1}), vol_annual_pct
 """
 
 from __future__ import annotations
@@ -24,25 +28,25 @@ from stock_predictor import config
 # Rækkefølge = kolonnerækkefølge ud af engineer_features (skal matche N_FEATURES).
 FEATURE_COLUMNS: tuple[str, ...] = (
     "rsi_14",
-    "macd",
-    "macd_signal",
-    "macd_hist",
-    "bb_upper",
-    "bb_lower",
-    "bb_width",
-    "ema_20",
-    "ema_50",
-    "obv",
+    "macd_norm",
+    "macd_signal_norm",
+    "macd_hist_norm",
+    "bb_upper_rel",
+    "bb_lower_rel",
+    "bb_width_rel",
+    "ema_20_rel",
+    "ema_50_rel",
+    "obv_delta",
     "stoch_k",
     "cci_20",
     "day_of_week",
     "month",
     "vix_close",
-    "open",
-    "high",
-    "low",
-    "close",
-    "volume",
+    "log_ret",
+    "high_ratio",
+    "low_ratio",
+    "close_ratio",
+    "vol_delta",
     "vol_annual_pct",
 )
 
@@ -99,10 +103,16 @@ def bollinger_bands(
     return upper, lower, width
 
 
-def obv(close: pd.Series, volume: pd.Series) -> pd.Series:
-    """On-Balance Volume: kumulativt volumen med fortegn af daglig prisændring."""
+def obv_delta(close: pd.Series, volume: pd.Series, window: int = 20) -> pd.Series:
+    """
+    Skalainvariant OBV-ændring: fortegn af daglig prisændring gange dagens volumen
+    relativt til eget rullende gennemsnit. Erstatter kumulativt OBV (ikke-stationært,
+    skalerer med aktiens absolutte volumen) med en retnings-vægtet relativ-volumen-puls.
+    """
     direction = np.sign(close.diff()).fillna(0.0)
-    return (direction * volume.astype(float)).fillna(0.0).cumsum()
+    vol = volume.astype(float)
+    avg_vol = vol.rolling(window=window, min_periods=window).mean().replace(0, np.nan)
+    return direction * vol / avg_vol
 
 
 def stochastic_k(
@@ -145,26 +155,40 @@ def cci(
 
 
 def _feature_frame(df: pd.DataFrame) -> pd.DataFrame:
-    """Alle 21 feature-kolonner (uden dropna), index = dato. Kræver OHLCV (+ valgfri vix_close)."""
+    """Alle 21 feature-kolonner (uden dropna), index = dato. Kræver OHLCV (+ valgfri vix_close).
+
+    Alle pris-afledte features er skalainvariante: indikatorer normaliseres med close
+    (eller er allerede afgrænsede), og rå OHLCV erstattes af log-afkast, intradag-ratios
+    (H/O, L/O, C/O) og volumen-delta.
+    """
     df = df.sort_index().copy()
+    open_ = df["open"].astype(float)
     close = df["close"].astype(float)
     high = df["high"].astype(float)
     low = df["low"].astype(float)
     vol = df["volume"].astype(float)
 
+    # Nævnere der må være nul (fx volumen-stop) → NaN i stedet for inf.
+    close_nz = close.replace(0, np.nan)
+    open_nz = open_.replace(0, np.nan)
+    vol_nz = vol.replace(0, np.nan)
+
     out = pd.DataFrame(index=df.index)
     out["rsi_14"] = rsi(close, 14)
+    # MACD i pris-enheder normaliseret med close → skalainvariant.
     macd_l, sig = macd_signal(close)
-    out["macd"] = macd_l
-    out["macd_signal"] = sig
-    out["macd_hist"] = macd_l - sig
+    out["macd_norm"] = macd_l / close_nz
+    out["macd_signal_norm"] = sig / close_nz
+    out["macd_hist_norm"] = (macd_l - sig) / close_nz
+    # Bollinger-bånd som relativ afstand fra close (bredde som fraktion af close).
     up, lo, width = bollinger_bands(close)
-    out["bb_upper"] = up
-    out["bb_lower"] = lo
-    out["bb_width"] = width
-    out["ema_20"] = ema(close, 20)
-    out["ema_50"] = ema(close, 50)
-    out["obv"] = obv(close, vol)
+    out["bb_upper_rel"] = up / close_nz - 1.0
+    out["bb_lower_rel"] = lo / close_nz - 1.0
+    out["bb_width_rel"] = width / close_nz
+    # EMA som prisens relative afstand fra glidende gennemsnit (+ = over MA).
+    out["ema_20_rel"] = close / ema(close, 20).replace(0, np.nan) - 1.0
+    out["ema_50_rel"] = close / ema(close, 50).replace(0, np.nan) - 1.0
+    out["obv_delta"] = obv_delta(close, vol)
     out["stoch_k"] = stochastic_k(high, low, close, 14)
     out["cci_20"] = cci(high, low, close, 20)
 
@@ -177,12 +201,12 @@ def _feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     else:
         out["vix_close"] = np.nan
 
-    # Rå OHLCV som features (absolutte niveauer — standardiseres ved træning).
-    out["open"] = df["open"].astype(float)
-    out["high"] = high
-    out["low"] = low
-    out["close"] = close
-    out["volume"] = vol
+    # Stationære pris-/volumen-features (ændring frem for niveau).
+    out["log_ret"] = np.log(close / close.shift(1))
+    out["high_ratio"] = high / open_nz
+    out["low_ratio"] = low / open_nz
+    out["close_ratio"] = close / open_nz
+    out["vol_delta"] = np.log(vol_nz / vol_nz.shift(1))
     if "vol_annual_pct" in df.columns:
         out["vol_annual_pct"] = pd.to_numeric(df["vol_annual_pct"], errors="coerce")
     else:

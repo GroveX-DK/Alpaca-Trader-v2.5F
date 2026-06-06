@@ -19,7 +19,7 @@ if str(_ROOT) not in sys.path:
 import joblib
 import numpy as np
 import torch
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -101,7 +101,7 @@ def _time_sort_split(samples: List[Sample], val_ratio: float) -> Tuple[List[Samp
 
 
 def _prepare_tensors(
-    scaler: StandardScaler,
+    scaler: RobustScaler,
     trains: List[Sample],
     vals: List[Sample],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -143,6 +143,8 @@ def train_model() -> None:
 
     calendar_days = int(cfg.TRAINING_YEARS * 366 + cfg.FETCH_EXTRA_DAYS)
 
+    # prefer_cache_only=False: tjek Alpaca for nye barer og opdatér cachen før træning;
+    # falder tilbage til (evt. forældet) cache hvis API mangler nøgler eller fejler.
     fetch_result = fetch_daily_bars(
         cfg.ALPACA_API_KEY,
         cfg.ALPACA_SECRET_KEY,
@@ -150,7 +152,7 @@ def train_model() -> None:
         end=None,
         lookback_calendar_days=calendar_days,
         extra_buffer_days=0,
-        prefer_cache_only=True,
+        prefer_cache_only=False,
     )
     bars = fetch_result.bars
     if fetch_result.cache_only:
@@ -177,7 +179,8 @@ def train_model() -> None:
     if not train_s:
         logger.error("Tom træningsmængde efter split. Afslutter.")
         return
-    scaler = StandardScaler()
+    # RobustScaler (median/IQR): robust over for de fede haler i log-afkast/volumen-delta.
+    scaler = RobustScaler()
     X_t, Y_t, X_v, Y_v = _prepare_tensors(scaler, train_s, val_s)
 
     train_pref = getattr(cfg, "TRAIN_DEVICE", "auto")
@@ -209,8 +212,8 @@ def train_model() -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning("torch.compile fejlede, fortsætter uden: %s", exc)
 
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
+    criterion = nn.HuberLoss(delta=float(getattr(cfg, "HUBER_DELTA", 1.0)))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
 
     lr_sched_enabled = bool(getattr(cfg, "LR_SCHEDULER_ENABLED", True)) and X_v is not None
     scheduler = None

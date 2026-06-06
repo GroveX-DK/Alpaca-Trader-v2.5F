@@ -14,10 +14,10 @@ Features slutter på dag `t`; score er estimatet for sessionen på dag `t+1`.
 
 ```bash
 # Efter ændring af label, features eller hyperparametre — altid træn først:
-python -m stock_predictor.main --train
+python "(fil lokation)" --train
 
 # Inferens + paper-rotation til stærkeste ticker:
-python -m stock_predictor.main --run
+python "(Fil lokation)" --run
 ```
 
 Valgfri lang historik: `python -m stock_predictor.tools.import_watchlist_csv_to_cache` før `--train`.
