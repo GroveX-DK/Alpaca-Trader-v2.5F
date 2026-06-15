@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
+from alpaca.data.enums import Adjustment
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -98,19 +99,57 @@ def _enrich_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return _with_vol_annual_pct(compute_watchlist_metrics(df))
 
 
+_MACRO_FRAME_CACHE: Optional[pd.DataFrame] = None
+_MACRO_FRAME_LOADED = False
+
+
+def _macro_frame_for_cache() -> Optional[pd.DataFrame]:
+    """Lazy-load den markeds-brede makro-frame (kun når MACRO_FEATURES_ENABLED).
+
+    Flag fra => None, så _dataset_for_cache opfører sig nøjagtig som før. Importen er
+    doven for at undgå cirkulær import (macro_features importerer fra data_fetcher).
+    """
+    global _MACRO_FRAME_CACHE, _MACRO_FRAME_LOADED
+    if not getattr(config, "MACRO_FEATURES_ENABLED", False):
+        return None
+    if not _MACRO_FRAME_LOADED:
+        try:
+            from stock_predictor.macro_features import load_macro_frame
+
+            _MACRO_FRAME_CACHE = load_macro_frame()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Kunne ikke indlæse makro-frame til cache: %s", exc)
+            _MACRO_FRAME_CACHE = None
+        _MACRO_FRAME_LOADED = True
+    return _MACRO_FRAME_CACHE
+
+
+def set_macro_frame_cache(frame: Optional[pd.DataFrame]) -> None:
+    """Sæt den in-proces makro-frame-cache eksplicit (fx efter en frisk genbygning).
+
+    Bruges af ensure_macro_oil_cache så inkrementel tail-merge (_dataset_for_cache →
+    _macro_frame_for_cache) i samme proces ser den nybyggede frame frem for en doven,
+    forældet indlæsning fra disk.
+    """
+    global _MACRO_FRAME_CACHE, _MACRO_FRAME_LOADED
+    _MACRO_FRAME_CACHE = frame
+    _MACRO_FRAME_LOADED = True
+
+
 def _dataset_for_cache(enriched: pd.DataFrame) -> pd.DataFrame:
     """
     Fuldt cache-datasæt der skrives til Parquet: OHLCV + Watchlist-metriker +
-    vol_annual_pct + vix_close (ffill) + alle stationære features (FEATURE_COLUMNS).
+    vol_annual_pct + vix_close (ffill) + (valgfri makro-krise-kolonner) + alle
+    stationære features (FEATURE_COLUMNS).
 
     Sikrer at de stationære feature-kolonner forbliver materialiseret i cachen efter
     inkrementel tail/backfill (ellers ville et gem via _enrich_ohlcv tabe dem). Nye barer
-    uden frisk ^VIX arver seneste kendte vix_close via ffill i build_dataset_frame.
+    uden frisk ^VIX/makro arver seneste kendte værdi via ffill i build_dataset_frame.
     """
     if enriched.empty:
         return enriched
     vix = enriched["vix_close"] if "vix_close" in enriched.columns else None
-    return build_dataset_frame(enriched, vix)
+    return build_dataset_frame(enriched, vix, _macro_frame_for_cache())
 
 
 def _read_cache_parquet(path: Path) -> Optional[pd.DataFrame]:
@@ -130,14 +169,19 @@ def _read_cache_parquet(path: Path) -> Optional[pd.DataFrame]:
         for col in ("open", "high", "low", "close", "volume"):
             if col not in df.columns:
                 return None
+        # Valgfri kilde-/eksternkolonner der skal bæres med (ud over OHLCV): vol/vix/news
+        # samt de markeds-brede makro-krise-kolonner, så engineer_features ser dem.
+        optional_cols = ("vol_annual_pct", "vix_close", "news_sentiment") + tuple(
+            getattr(config, "MACRO_FEATURE_COLUMNS", ())
+        )
         cols = ["open", "high", "low", "close", "volume"]
-        for opt in ("vol_annual_pct", "vix_close"):
+        for opt in optional_cols:
             if opt in df.columns:
                 cols.append(opt)
         out = df[cols].copy()
         for c in ("open", "high", "low", "close", "volume"):
             out[c] = out[c].astype(float)
-        for opt in ("vol_annual_pct", "vix_close"):
+        for opt in optional_cols:
             if opt in out.columns:
                 out[opt] = out[opt].astype(float)
         return out
@@ -191,6 +235,7 @@ def _fetch_symbol_range(
             timeframe=TimeFrame.Day,
             start=start,
             end=end,
+            adjustment=Adjustment(config.OHLCV_ADJUSTMENT),
             feed="iex",
         )
         bars = client.get_stock_bars(req)
@@ -218,6 +263,7 @@ def _fetch_all_symbols_batch(
             timeframe=TimeFrame.Day,
             start=start,
             end=end,
+            adjustment=Adjustment(config.OHLCV_ADJUSTMENT),
             feed="iex",
         )
         bars = client.get_stock_bars(req)
@@ -263,6 +309,22 @@ def _merge_trim_save_symbol(
         return df.loc[mask].sort_index()
 
     if cached is None or cached.empty:
+        fresh = _fetch_symbol_range(client, symbol, want_start, want_end)
+        if fresh is None:
+            return None
+        full = _enrich_ohlcv(fresh)
+        merged = trim(full)
+        if not merged.empty:
+            try:
+                _atomic_save_parquet(_dataset_for_cache(full), path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Kunne ikke skrive cache for %s: %s", symbol, exc)
+        return merged if not merged.empty else None
+
+    # Justerede priser (split/udbytte) omskaleres bagudrettet ved nye corporate actions,
+    # så inkrementel splice af gammel cache + frisk tail ville give en skala-diskontinuitet.
+    # Genhent derfor hele vinduet i én konsistent skala og overskriv cachen.
+    if Adjustment(config.OHLCV_ADJUSTMENT) is not Adjustment.RAW:
         fresh = _fetch_symbol_range(client, symbol, want_start, want_end)
         if fresh is None:
             return None
@@ -465,3 +527,79 @@ def fetch_daily_bars(
                     dfs[sym] = _enrich_ohlcv(trimmed)
 
     return FetchBarsResult(bars=dfs, cache_only=False, required_end=required_end)
+
+
+def fetch_todays_open(
+    api_key: str,
+    secret_key: str,
+    symbols: list[str],
+    *,
+    as_of: date | None = None,
+) -> Dict[str, float]:
+    """Dagens (forming) daglige bars open pr. symbol — kendt lige efter markedsåbning.
+
+    Henter dagens daglige bar live fra Alpaca (passerer required_last_bar_date, som ellers
+    stopper ved gårsdagens fulde bar). Returnerer {symbol: open} for symboler med en bar
+    dateret i dag. Tom dict hvis nøgler mangler, markedet ikke er åbnet endnu, eller kaldet
+    fejler — kalderen falder så neutralt tilbage (gap 0 via append_todays_open_row).
+    """
+    out: Dict[str, float] = {}
+    syms = sorted({s.strip().upper() for s in symbols if s.strip()})
+    if not syms or not (api_key and secret_key):
+        return out
+    today = _ts(as_of or date.today())
+    try:
+        client = StockHistoricalDataClient(api_key, secret_key)
+        req = StockBarsRequest(
+            symbol_or_symbols=syms,
+            timeframe=TimeFrame.Day,
+            start=(as_of or date.today()),
+            adjustment=Adjustment(config.OHLCV_ADJUSTMENT),
+            feed="iex",
+        )
+        bars = client.get_stock_bars(req)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Kunne ikke hente dagens open fra Alpaca: %s", exc)
+        return out
+
+    data = getattr(bars, "data", {}) or {}
+    for sym in syms:
+        sym_bars = data.get(sym)
+        if not sym_bars:
+            continue
+        df = _bars_list_to_df(sym_bars)
+        if df.empty or _ts(df.index.max()) != today:
+            continue  # ingen bar dateret i dag (fx før åbning / helligdag)
+        op = float(df["open"].iloc[-1])
+        if op > 0:
+            out[sym] = op
+    return out
+
+
+def append_todays_open_row(
+    ohlcv: pd.DataFrame,
+    open_px: float | None,
+    *,
+    as_of: date | None = None,
+) -> pd.DataFrame:
+    """Tilføj en fantom-række for i dag, så sidste fulde bar får next_open_gap udfyldt.
+
+    Dagens open (kendt lige efter åbning) bliver open_{t+1} for sidste komplette bar t, så
+    feature-vinduet stadig slutter ved t men nu bærer dagens åbnings-gap. Manglende open =>
+    brug sidste close (gap 0, neutralt). Øvrige OHLCV er NaN; fantom-rækken droppes selv af
+    engineer_features (mangler dagens close). No-op hvis cachen allerede indeholder i dag.
+    """
+    if ohlcv is None or ohlcv.empty or "close" not in ohlcv.columns:
+        return ohlcv
+    today = _ts(as_of or date.today())
+    if today <= _ts(ohlcv.index.max()):
+        return ohlcv  # cachen indeholder allerede i dag — intet at injicere
+    try:
+        last_close = float(ohlcv["close"].iloc[-1])
+    except (TypeError, ValueError):
+        return ohlcv
+    op = float(open_px) if (open_px is not None and float(open_px) > 0) else last_close
+    nan = float("nan")
+    row = {c: (op if c == "open" else nan) for c in ohlcv.columns}
+    phantom = pd.DataFrame([row], index=pd.DatetimeIndex([today]))
+    return pd.concat([ohlcv, phantom]).sort_index()
