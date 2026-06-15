@@ -25,8 +25,8 @@ from numpy.lib.stride_tricks import sliding_window_view
 
 from stock_predictor import config
 
-# Rækkefølge = kolonnerækkefølge ud af engineer_features (skal matche N_FEATURES).
-FEATURE_COLUMNS: tuple[str, ...] = (
+# Basis-feature-kolonner (rækkefølge = kolonnerækkefølge ud af engineer_features).
+_BASE_FEATURE_COLUMNS: tuple[str, ...] = (
     "rsi_14",
     "macd_norm",
     "macd_signal_norm",
@@ -48,6 +48,25 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     "close_ratio",
     "vol_delta",
     "vol_annual_pct",
+    "news_sentiment",
+)
+
+# Dagens-open-feature appendes KUN når OPEN_FEATURE_ENABLED er til (mellem basis og makro),
+# så flag fra => uændret feature-sæt. next_open_gap = log-gap fra close_t til open_{t+1}.
+_OPEN_FEATURE_COLUMNS: tuple[str, ...] = (
+    ("next_open_gap",) if getattr(config, "OPEN_FEATURE_ENABLED", False) else ()
+)
+
+# Markeds-brede makro-kolonner (krise-signaler + olie) appendes KUN når flag er til, så
+# flag fra => uændret 22-feature-sæt. config ejer navnene; her ejes beregningen.
+_MACRO_FEATURE_COLUMNS: tuple[str, ...] = tuple(getattr(config, "MACRO_FEATURE_COLUMNS", ()))
+
+# Autoritativ feature-liste (skal matche config.N_FEATURES). Dynamisk efter flag,
+# så engineer_features og scaler/model altid er enige om kolonnesættet.
+FEATURE_COLUMNS: tuple[str, ...] = (
+    _BASE_FEATURE_COLUMNS
+    + _OPEN_FEATURE_COLUMNS
+    + (_MACRO_FEATURE_COLUMNS if getattr(config, "MACRO_FEATURES_ENABLED", False) else ())
 )
 
 
@@ -212,6 +231,31 @@ def _feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     else:
         out["vol_annual_pct"] = rolling_annualized_log_vol_pct(close)
 
+    # Nyheds-sentiment (finBERT, p_pos − p_neg ∈ [-1, 1]). Manglende/ukendte dage → 0.0
+    # (neutral) i stedet for NaN, så engineer_features ikke dropper rækker uden nyheder.
+    if "news_sentiment" in df.columns:
+        out["news_sentiment"] = pd.to_numeric(df["news_sentiment"], errors="coerce").fillna(0.0)
+    else:
+        out["news_sentiment"] = 0.0
+
+    # Dagens-open-gap: log-gap fra dag t's close til dag t+1's open. Live kører lige efter
+    # åbning, så næste dags open er kendt ved trade-tid — samme alignment som target
+    # (open→close næste dag), derfor ingen leakage. Sidste række er NaN (intet t+1) og
+    # droppes af engineer_features (kan ej være træningssample; target er også NaN der).
+    # Beregnes altid; FEATURE_COLUMNS afgør om den faktisk indgår (flag-styret).
+    out["next_open_gap"] = np.log(open_.shift(-1) / close_nz)
+
+    # Markeds-brede makro-/krise-signaler (samme mønster som vix_close): læs fra base-
+    # kolonnen hvis til stede (ffill), ellers neutralværdi — så rækker aldrig droppes.
+    # Beregnes altid; FEATURE_COLUMNS afgør om de faktisk indgår (flag-styret).
+    neutral = getattr(config, "MACRO_FEATURE_NEUTRAL", {})
+    for col in _MACRO_FEATURE_COLUMNS:
+        fill = float(neutral.get(col, 0.0))
+        if col in df.columns:
+            out[col] = pd.to_numeric(df[col], errors="coerce").ffill().fillna(fill)
+        else:
+            out[col] = fill
+
     return out[list(FEATURE_COLUMNS)]
 
 
@@ -226,18 +270,33 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def build_dataset_frame(ohlcv: pd.DataFrame, vix_close: pd.Series | None = None) -> pd.DataFrame:
+def build_dataset_frame(
+    ohlcv: pd.DataFrame,
+    vix_close: pd.Series | None = None,
+    macro: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """
-    Fuldt datasæt til cache: OHLCV + vol_annual_pct + vix_close + alle 21 features
-    (uden dropna, så fuld historik bevares med NaN-opvarmning).
+    Fuldt datasæt til cache: OHLCV + vol_annual_pct + vix_close + (valgfri makro-
+    krise-signaler) + alle FEATURE_COLUMNS (uden dropna, så fuld historik bevares
+    med NaN-opvarmning).
+
+    ``macro``: markeds-bred frame (date-index) med kolonner i config.MACRO_FEATURE_COLUMNS.
+    Joines på base-index (ffill) som vix_close, så de materialiseres i cachen og bæres
+    med ved senere inkrementel merge. Manglende kolonner/dage fyldes neutralt i features.
     """
     base = ohlcv.sort_index().copy()
     if vix_close is not None:
         vix = pd.to_numeric(vix_close, errors="coerce")
         base["vix_close"] = vix.reindex(base.index).ffill()
+    if macro is not None and not macro.empty:
+        m = macro.sort_index()
+        m.index = pd.to_datetime(m.index)
+        for col in _MACRO_FEATURE_COLUMNS:
+            if col in m.columns:
+                base[col] = pd.to_numeric(m[col], errors="coerce").reindex(base.index).ffill()
     base["vol_annual_pct"] = rolling_annualized_log_vol_pct(base["close"])
     feats = _feature_frame(base)
-    # Undgå dublerede kolonner (vix_close findes både i base og feats).
+    # Undgå dublerede kolonner (vix_close/makro findes både i base og feats).
     extra = feats.drop(columns=[c for c in feats.columns if c in base.columns], errors="ignore")
     return pd.concat([base, extra], axis=1)
 
