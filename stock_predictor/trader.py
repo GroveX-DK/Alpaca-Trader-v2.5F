@@ -373,7 +373,10 @@ def _finalize_open_trade(predicted_pct: Optional[float]) -> None:
                 "Ingen lukkekurs til beregn-afkast — springer CSV-linje for %s.", symbol,
             )
             continue
-        actual_pct = (close_px - avg) / max(avg, 1e-9) * 100.0
+        # Short-positioner (negativ qty) tjener når prisen FALDER → vend fortegnet.
+        qty = float(getattr(pos, "qty", 0.0) or 0.0)
+        raw_pct = (close_px - avg) / max(avg, 1e-9) * 100.0
+        actual_pct = raw_pct if qty >= 0.0 else -raw_pct
         predicted = predicted_pct if predicted_pct is not None else float("nan")
         _append_trade_csv(
             {
@@ -386,8 +389,13 @@ def _finalize_open_trade(predicted_pct: Optional[float]) -> None:
         )
 
 
-def rotate_to_symbol(symbol: str, predicted_gain_pct: float) -> None:
-    """Luk eksisterende positioner, hedging log, derefter åbn alle midler i ét symbol."""
+def rotate_to_symbol(symbol: str, predicted_gain_pct: float, side: str = "long") -> None:
+    """Luk eksisterende positioner, log dem, og åbn derefter alle midler i ét symbol.
+
+    ``side``: "long" (default — køb) eller "short" (sælg short hele budgettet i navnet, kun
+    hele aktier og kun shortable navne). Den retningsbestemte live-sti
+    (DIRECTIONAL_LIVE_ENABLED) sender "short" når den forudsagte bevægelse er negativ.
+    """
 
     if not config.ALPACA_API_KEY or not config.ALPACA_SECRET_KEY:
         logger.error("Manglende API-nøgler — ingen handel.")
@@ -582,8 +590,26 @@ def rotate_to_symbol(symbol: str, predicted_gain_pct: float) -> None:
             "Prøv senere eller næste handelsdag.",
         )
 
+    is_short = str(side).lower() == "short"
+    if is_short and not _is_shortable(tc, symbol):
+        logger.error("Spring short over: %s er ikke shortable hos Alpaca.", symbol)
+        raise RuntimeError(f"{symbol} er ikke shortable.")
+
     try:
-        if last_px and last_px > 0:
+        if is_short:
+            # Short kræver typisk hele aktier (ingen fraktioneret short) og en pris til sizing.
+            if not (last_px and last_px > 0):
+                raise RuntimeError(f"Mangler pris til at størrelsesberegne short i {symbol}.")
+            qty = math.floor(notional / (last_px * 1.03))
+            if qty <= 0:
+                raise RuntimeError(f"For lille budget til at shorte mindst én aktie i {symbol}.")
+            mr = MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+            )
+        elif last_px and last_px > 0:
             # Sidste luk kan være lavere end markedsordrens udfyldelse → buffer mod utilstrækkelig kontant ved udfyldelse.
             conservative_px = last_px * 1.03
             qty = notional / conservative_px * 0.998
@@ -618,7 +644,7 @@ def rotate_to_symbol(symbol: str, predicted_gain_pct: float) -> None:
     _append_trade_activity_csv(
         {
             "logged_at": datetime.now().isoformat(timespec="seconds"),
-            "event": "OPEN_BUY",
+            "event": "OPEN_SHORT" if is_short else "OPEN_BUY",
             "symbol": symbol,
             "amount_usd": round(notional, 2),
             "qty": float(qty_val) if qty_val is not None else "",
@@ -639,15 +665,164 @@ def rotate_to_symbol(symbol: str, predicted_gain_pct: float) -> None:
             "symbol": symbol,
             "predicted_gain_pct": predicted_gain_pct,
             "opened_on": date.today().isoformat(),
+            "side": side,
         }
     )
     logger.info(
-        "Kører nu paper-position i %s (forudsagt open→close %.4f pct). Cash %.2f BP %.2f",
+        "Kører nu paper-position i %s (%s, forudsagt open→close %.4f pct). Cash %.2f BP %.2f",
         symbol,
+        side,
         predicted_gain_pct,
         cash_balance,
         am["buying_power"],
     )
 
 
-__all__ = ["rotate_to_symbol"]
+def _last_prices(symbols: list[str]) -> dict[str, float]:
+    """Seneste daglige lukkekurser for en liste symboler (ét batch-kald) til qty-beregning."""
+    out: dict[str, float] = {}
+    if not symbols:
+        return out
+    try:
+        dc = StockHistoricalDataClient(config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY)
+        end = date.today()
+        req = StockBarsRequest(
+            symbol_or_symbols=symbols,
+            timeframe=TimeFrame.Day,
+            start=end - timedelta(days=14),
+            end=end,
+            feed="iex",
+        )
+        bs = dc.get_stock_bars(req)
+        for sym in symbols:
+            seq = bs.data.get(sym)
+            if seq:
+                out[sym] = float(seq[-1].close)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Kunne ikke hente seneste priser til long/short-sizing: %s", exc)
+    return out
+
+
+def _is_shortable(tc: "TradingClient", symbol: str) -> bool:
+    """True hvis Alpaca markerer aktivet som shortable (ellers droppes short-benet)."""
+    try:
+        asset = tc.get_asset(symbol)
+        return bool(getattr(asset, "shortable", False)) and bool(getattr(asset, "tradable", True))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Kunne ikke tjekke shortability for %s: %s — springer short over.", symbol, exc)
+        return False
+
+
+def rebalance_long_short(
+    longs: list[tuple[str, float]],
+    shorts: list[tuple[str, float]],
+    *,
+    exposure: float | None = None,
+) -> None:
+    """Markeds-neutral paper-rebalancering: luk alt, køb longs og short bottom-navne.
+
+    ``longs``/``shorts``: lister af (symbol, forudsagt_pct), typisk top-k og bottom-k fra
+    predict_rankings_detailed. Budgettet (broker-loft − reserve) fordeles ligeligt over alle
+    ben, så long- og short-notional er ens (dollar-neutral) ved lige antal. ``exposure`` (0..1)
+    skalerer det samlede deployerede beløb (default LONG_SHORT_MAX_GROSS). Ikke-shortable navne
+    springes over. Kun paper (paper=True). Gated af LONG_SHORT_LIVE_ENABLED via main.
+    """
+    if not config.ALPACA_API_KEY or not config.ALPACA_SECRET_KEY:
+        logger.error("Manglende API-nøgler — ingen handel.")
+        raise RuntimeError("Manglende Alpaca-nøgler.")
+
+    # Log sidste åbne positioner som afsluttede før vi lukker (genbruger eksisterende logik).
+    state = _read_state()
+    predicted_from_prev = (
+        float(state["predicted_gain_pct"]) if state and "predicted_gain_pct" in state else None
+    )
+    try:
+        _finalize_open_trade(predicted_from_prev)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Kunne ikke færdiggøre sidste trades log (non-fatal): %s", exc)
+
+    tc = TradingClient(config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY, paper=True)
+    try:
+        tc.close_all_positions(cancel_orders=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("close_all_positions fejlede (fortsætter): %s", exc)
+    _wait_positions_closed(tc, _POST_CLOSE_CASH_MAX_WAIT_SEC)
+
+    acct = tc.get_account()
+    ceiling_usd, am = _trade_budget_usd(acct, post_rotation_fallback=True)
+    reserve = max(50.0, ceiling_usd * 0.005)
+    budget = ceiling_usd - reserve
+    exp = float(exposure if exposure is not None else getattr(config, "LONG_SHORT_MAX_GROSS", 1.0))
+    budget *= max(0.0, min(1.0, exp))
+    if budget <= 0:
+        logger.error("Ikke tilstrækkelig købekraft til long/short (loft=%.2f).", ceiling_usd)
+        raise RuntimeError("Ikke tilstrækkelig købekraft til long/short.")
+
+    # Frasortér ikke-shortable short-navne før budgettet fordeles.
+    long_syms = [s for s, _ in longs]
+    short_syms = [s for s, _ in shorts if _is_shortable(tc, s)]
+    dropped = [s for s, _ in shorts if s not in short_syms]
+    if dropped:
+        logger.warning("Short-ben droppet (ikke shortable): %s", ", ".join(dropped))
+    n_legs = len(long_syms) + len(short_syms)
+    if n_legs == 0:
+        logger.error("Ingen handlbare ben (longs=%s, shortable shorts=%s).", len(long_syms), len(short_syms))
+        raise RuntimeError("Ingen handlbare long/short-ben.")
+    per_leg = budget / n_legs
+
+    prices = _last_prices(long_syms + short_syms)
+    pred_map = {s: p for s, p in (*longs, *shorts)}
+    logger.info(
+        "Long/short paper-rebalance: %s longs, %s shorts, ~%.2f USD/ben (budget %.2f, eksp %.2f).",
+        len(long_syms), len(short_syms), per_leg, budget, exp,
+    )
+
+    def _submit(symbol: str, side: OrderSide) -> None:
+        px = prices.get(symbol)
+        try:
+            if side == OrderSide.SELL and px and px > 0:
+                # Short kræver typisk hele aktier (ingen fraktioneret short).
+                qty = math.floor(per_leg / px)
+                if qty <= 0:
+                    logger.warning("Springer short %s over: per-ben %.2f < pris %.2f.", symbol, per_leg, px)
+                    return
+                mr = MarketOrderRequest(symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.DAY)
+            else:
+                # Long: notional (fraktioneret tilladt).
+                mr = MarketOrderRequest(
+                    symbol=symbol, notional=round(per_leg, 2), side=side, time_in_force=TimeInForce.DAY,
+                )
+            tc.submit_order(order_data=mr)
+            _append_trade_activity_csv({
+                "logged_at": datetime.now().isoformat(timespec="seconds"),
+                "event": "OPEN_LONG" if side == OrderSide.BUY else "OPEN_SHORT",
+                "symbol": symbol,
+                "amount_usd": round(per_leg, 2),
+                "qty": getattr(mr, "qty", ""),
+                "predicted_gain_pct": pred_map.get(symbol, ""),
+                "cash_before": round(am["cash"], 2),
+                "buying_power_before": round(am["buying_power"], 2),
+                "daytrading_buying_power_before": round(am["daytrading_buying_power"], 2),
+                "regt_buying_power_before": round(am["regt_buying_power"], 2),
+                "non_marginable_buying_power_before": round(am["non_marginable_buying_power"], 2),
+                "notes": "long/short markeds-neutral (paper); per-ben = (loft−reserve)·eksp / antal_ben",
+            })
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Long/short-ordre fejlede for %s (%s): %s", symbol, side, exc)
+
+    for sym in long_syms:
+        _submit(sym, OrderSide.BUY)
+    for sym in short_syms:
+        _submit(sym, OrderSide.SELL)
+
+    _write_state({
+        "mode": "long_short",
+        "longs": long_syms,
+        "shorts": short_syms,
+        "predicted_gain_pct": (sum(pred_map[s] for s in long_syms) / len(long_syms)) if long_syms else None,
+        "opened_on": date.today().isoformat(),
+    })
+    logger.info("Long/short paper-bog åbnet: long %s | short %s.", long_syms, short_syms)
+
+
+__all__ = ["rotate_to_symbol", "rebalance_long_short"]

@@ -13,8 +13,15 @@ class DailyLSTM(nn.Module):
         hidden_size: int = 128,
         num_layers: int = 2,
         dropout: float = 0.2,
+        n_outputs: int = 1,
     ) -> None:
+        """``n_outputs``: 1 = punkt-estimat (Huber); >1 = kvantiler (usikkerheds-head).
+
+        Med kvantiler forudsiger hovedet fx 10/50/90-percentilen af næste dags open→close.
+        Score til ranking = median (q50); konfidensbånd = q90 − q10 (bredt => usikkert).
+        """
         super().__init__()
+        self.n_outputs = int(n_outputs)
         self.lstm = nn.LSTM(
             input_size=n_features,
             hidden_size=hidden_size,
@@ -24,13 +31,13 @@ class DailyLSTM(nn.Module):
         )
         self.head = nn.Sequential(
             nn.Dropout(dropout),
-            nn.Linear(hidden_size, 1),
+            nn.Linear(hidden_size, self.n_outputs),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: (batch, seq_len, n_features)
-        return: (batch, 1)
+        return: (batch, n_outputs)  — (batch, 1) i punkt-estimat-tilfældet.
         """
         _, (hn, _) = self.lstm(x)
         last = hn[-1]
