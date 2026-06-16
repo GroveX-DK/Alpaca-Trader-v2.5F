@@ -28,7 +28,6 @@ import pandas as pd
 
 from stock_predictor import config
 from stock_predictor.data_fetcher import _atomic_save_parquet, _cache_path
-from stock_predictor.feature_engineer import rolling_annualized_log_vol_pct
 
 logger = logging.getLogger(__name__)
 
@@ -161,14 +160,6 @@ def build_macro_frame(cache_dir: Path | None = None, *, period: str = "max") -> 
     if move is not None:
         cols["move_chg"] = move.pct_change(periods=5)
 
-    # --- Olie (WTI front-month CL=F): log-afkast + annualiseret log-vol. Markeds-bred
-    #     (relevant for hele markedet, især de ~19 energiselskaber). Samme kilde (yfinance)
-    #     og form som ^VIX-familien / de stationære pris-features (log_ret, vol_annual_pct). ---
-    oil = _yf_close("CL=F", period)
-    if oil is not None:
-        cols["oil_log_ret"] = np.log(oil / oil.shift(1)).replace([np.inf, -np.inf], np.nan)
-        cols["oil_vol_annual_pct"] = rolling_annualized_log_vol_pct(oil)
-
     # --- Breadth + tværsnits-korrelation fra cachen (ingen ekstern kilde) ---
     closes = _watchlist_close_frame(cdir)
     if not closes.empty:
@@ -227,85 +218,9 @@ def build_and_cache_macro_frame(*, period: str = "max") -> pd.DataFrame:
     return frame
 
 
-def ensure_macro_oil_cache(*, force_rebuild: bool = False) -> None:
-    """Sørg for at makro-/olie-kolonnerne er materialiseret i Parquet-cachen før træning.
-
-    Kaldes i starten af train_model, så `--train` er én kommando: (1) genbyg den markeds-brede
-    makro-frame (inkl. WTI CL=F) hvis den mangler/er forældet, (2) sæt den in-proces frame-cache
-    så inkrementel tail-merge bruger den friske frame, (3) materialisér kolonnerne ind i hver
-    ticker-parquet der mangler én eller flere af config.MACRO_FEATURE_COLUMNS (billig skema-tjek).
-    Værdi-/dag-opdatering for friske barer sker via den normale inkrementelle tail-merge, så her
-    materialiseres kun filer hvor kolonne-SÆTTET mangler (fx første kørsel efter at olie er tilføjet).
-    No-op når MACRO_FEATURES_ENABLED er slået fra.
-    """
-    if not getattr(config, "MACRO_FEATURES_ENABLED", False):
-        return
-
-    from stock_predictor.data_fetcher import required_last_bar_date, set_macro_frame_cache
-
-    frame = load_macro_frame()
-    stale = (
-        force_rebuild
-        or frame is None
-        or frame.empty
-        or frame.index.max().date() < required_last_bar_date()
-    )
-    if stale:
-        try:
-            rebuilt = build_and_cache_macro_frame()
-            if rebuilt is not None and not rebuilt.empty:
-                frame = rebuilt
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Makro-/olie-frame genbygning fejlede (bruger gemt frame): %s", exc)
-
-    if frame is None or frame.empty:
-        logger.warning("Ingen makro-/olie-frame tilgængelig — springer cache-materialisering over.")
-        return
-
-    # Lad inkrementel tail-merge i denne proces bruge den friske frame.
-    set_macro_frame_cache(frame)
-
-    expected = set(config.MACRO_FEATURE_COLUMNS)
-    cache_dir = Path(config.CACHE_DIR)
-    files = sorted(cache_dir.glob("*.parquet"))
-    todo: list[Path] = []
-    for path in files:
-        try:
-            import pyarrow.parquet as pq
-
-            names = set(pq.ParquetFile(path).schema.names)
-        except Exception:  # noqa: BLE001 - fald tilbage til fuld læsning ved skema-fejl
-            try:
-                names = set(pd.read_parquet(path).columns)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("Springer %s over (kan ikke læse skema): %s", path.name, exc)
-                continue
-        if not expected.issubset(names):
-            todo.append(path)
-
-    if not todo:
-        logger.info("Makro-/olie-kolonner allerede i alle %s cache-filer.", len(files))
-        return
-
-    # Doven import (som main.py → tools.update_news_sentiment): undgår import-cyklus, da
-    # tools.backfill_macro_features importerer fra dette modul ved load-tid.
-    from stock_predictor.tools.backfill_macro_features import backfill_file
-
-    logger.info("Materialiserer makro-/olie-kolonner i %s/%s cache-filer …", len(todo), len(files))
-    ok = 0
-    for path in todo:
-        try:
-            if backfill_file(path, frame) > 0:
-                ok += 1
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Materialisering fejlede for %s: %s", path.name, exc)
-    logger.info("Makro-/olie-materialisering færdig: %s/%s filer opdateret.", ok, len(todo))
-
-
 __all__ = [
     "build_macro_frame",
     "build_and_cache_macro_frame",
     "save_macro_frame",
     "load_macro_frame",
-    "ensure_macro_oil_cache",
 ]
