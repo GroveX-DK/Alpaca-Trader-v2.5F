@@ -24,11 +24,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from stock_predictor import config  # noqa: E402
-from stock_predictor.data_fetcher import (  # noqa: E402
-    append_todays_open_row,
-    fetch_daily_bars,
-    fetch_todays_open,
-)
+from stock_predictor.data_fetcher import fetch_daily_bars  # noqa: E402
 from stock_predictor.feature_engineer import engineer_features  # noqa: E402
 from stock_predictor.model import DailyLSTM  # noqa: E402
 from stock_predictor.torch_device import resolve_device  # noqa: E402
@@ -132,19 +128,6 @@ def _score_watchlist() -> Tuple[dict, dict]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("News-sentiment refresh sprunget over: %s", exc)
 
-    # Dagens open (kendt lige efter åbning) injiceres som open_{t+1} for sidste fulde bar,
-    # så modellen får dagens åbnings-gap (next_open_gap) i vinduets sidste række. Hentes
-    # én gang for hele watchlisten; manglende open => neutralt gap 0 (append-helperen).
-    todays_open: dict[str, float] = {}
-    if getattr(config, "OPEN_FEATURE_ENABLED", False):
-        try:
-            todays_open = fetch_todays_open(
-                config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY, list(bars.keys())
-            )
-            logger.info("Dagens open hentet for %s/%s symboler.", len(todays_open), len(bars))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Dagens-open-hentning sprunget over: %s", exc)
-
     score_map: dict[str, float] = {}
     band_map: dict[str, float] = {}
 
@@ -153,8 +136,6 @@ def _score_watchlist() -> Tuple[dict, dict]:
         if ohlcv is None or ohlcv.empty:
             logger.warning("Spring %s over (manglende data).", sym)
             continue
-        if getattr(config, "OPEN_FEATURE_ENABLED", False):
-            ohlcv = append_todays_open_row(ohlcv, todays_open.get(sym))
         try:
             feats = engineer_features(ohlcv)
         except Exception as exc:  # noqa: BLE001

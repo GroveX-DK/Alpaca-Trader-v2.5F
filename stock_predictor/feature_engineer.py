@@ -51,22 +51,14 @@ _BASE_FEATURE_COLUMNS: tuple[str, ...] = (
     "news_sentiment",
 )
 
-# Dagens-open-feature appendes KUN når OPEN_FEATURE_ENABLED er til (mellem basis og makro),
-# så flag fra => uændret feature-sæt. next_open_gap = log-gap fra close_t til open_{t+1}.
-_OPEN_FEATURE_COLUMNS: tuple[str, ...] = (
-    ("next_open_gap",) if getattr(config, "OPEN_FEATURE_ENABLED", False) else ()
-)
-
-# Markeds-brede makro-kolonner (krise-signaler + olie) appendes KUN når flag er til, så
+# Markeds-brede makro-kolonner (krise-signaler) appendes KUN når flag er til, så
 # flag fra => uændret 22-feature-sæt. config ejer navnene; her ejes beregningen.
 _MACRO_FEATURE_COLUMNS: tuple[str, ...] = tuple(getattr(config, "MACRO_FEATURE_COLUMNS", ()))
 
 # Autoritativ feature-liste (skal matche config.N_FEATURES). Dynamisk efter flag,
 # så engineer_features og scaler/model altid er enige om kolonnesættet.
-FEATURE_COLUMNS: tuple[str, ...] = (
-    _BASE_FEATURE_COLUMNS
-    + _OPEN_FEATURE_COLUMNS
-    + (_MACRO_FEATURE_COLUMNS if getattr(config, "MACRO_FEATURES_ENABLED", False) else ())
+FEATURE_COLUMNS: tuple[str, ...] = _BASE_FEATURE_COLUMNS + (
+    _MACRO_FEATURE_COLUMNS if getattr(config, "MACRO_FEATURES_ENABLED", False) else ()
 )
 
 
@@ -237,13 +229,6 @@ def _feature_frame(df: pd.DataFrame) -> pd.DataFrame:
         out["news_sentiment"] = pd.to_numeric(df["news_sentiment"], errors="coerce").fillna(0.0)
     else:
         out["news_sentiment"] = 0.0
-
-    # Dagens-open-gap: log-gap fra dag t's close til dag t+1's open. Live kører lige efter
-    # åbning, så næste dags open er kendt ved trade-tid — samme alignment som target
-    # (open→close næste dag), derfor ingen leakage. Sidste række er NaN (intet t+1) og
-    # droppes af engineer_features (kan ej være træningssample; target er også NaN der).
-    # Beregnes altid; FEATURE_COLUMNS afgør om den faktisk indgår (flag-styret).
-    out["next_open_gap"] = np.log(open_.shift(-1) / close_nz)
 
     # Markeds-brede makro-/krise-signaler (samme mønster som vix_close): læs fra base-
     # kolonnen hvis til stede (ffill), ellers neutralværdi — så rækker aldrig droppes.

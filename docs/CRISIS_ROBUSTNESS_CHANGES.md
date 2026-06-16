@@ -220,62 +220,22 @@ net-of-cost curve vs SPY, and that COVID/2022 drawdown shrinks (shorts fire on b
 restores gross numbers; restore `SEQ_LEN=2000`/`EPOCHS`/`EARLY_STOP_PATIENCE` and retrain for the
 old training regime.
 
-### Stage 6 — Two new inputs: today's open gap + oil price (done — code); cache backfill + retrain operational
+### Stage 6 — Today's-open-gap + oil-price inputs: added (commit d8d1bf1) then fully reverted
 
-Rationale: the live pipeline runs **right after the open**, so today's open is known — but the model
-never saw it (`required_last_bar_date` ends the fetch at yesterday's complete bar, and the target is
-the *next* day's open→close). And oil moves the whole market (esp. the ~19 energy names) yet had no
-input. Both added as scale-invariant features, flag-gated. **`N_FEATURES` 28 → 31.**
+Both inputs were added — open-gap `next_open_gap` (`ln(open_{t+1}/close_t)`) and oil
+`oil_log_ret`/`oil_vol_annual_pct` (WTI `CL=F`) — and committed in **`d8d1bf1`** (`N_FEATURES` 28→31),
+then **fully reverted in the code** because the 31-feature model collapsed in the 2015 regime backtest:
+`best` **−97.7%** / `avg` **−88.9%** vs the prior 28-feature model's **+180–305%** (same SPY ~+300%).
+The all-in single-name strategy amplified the lost directional edge into ruin. The commit is kept in
+history; the working tree is back to the **28-feature** set (22 base + 6 macro).
 
-**1) Today's-open gap (`next_open_gap`)** — `ln(open_{t+1} / close_t)`, the overnight gap into the
-prediction day's open. Same time-alignment as the target (open→close of day t+1), so **no leakage**:
-the gap uses only the prediction day's open, which is known at trade time.
-- `config.py`: new flag `OPEN_FEATURE_ENABLED = True` (Option 5); `N_FEATURES` now
-  `= _BASE_N_FEATURES(22) + (1 if OPEN_FEATURE_ENABLED) + (len(MACRO_FEATURE_COLUMNS) if MACRO_FEATURES_ENABLED)`.
-- `feature_engineer.py`: `_OPEN_FEATURE_COLUMNS = ("next_open_gap",)` folded into `FEATURE_COLUMNS`
-  between base and macro (only when flag on); `_feature_frame` computes
-  `out["next_open_gap"] = np.log(open_.shift(-1) / close_nz)`. The last history row is NaN (no t+1)
-  and is dropped by `engineer_features` — it was never a training sample (target also NaN there).
-  Recomputed from OHLCV every time, so **no cache backfill needed** for this column.
-- `data_fetcher.py`: new `fetch_todays_open(...)` (live daily-bar fetch that passes
-  `required_last_bar_date`, returns `{sym: today_open}`, `{}` before open / no keys) and
-  `append_todays_open_row(...)` (appends a phantom today-row carrying only the open, so the last
-  complete bar gets `next_open_gap`; the phantom row is dropped by `dropna`; missing open ⇒ gap 0).
-- `predict.py`: `_score_watchlist` fetches today's open once for the watchlist and injects it per
-  symbol before `engineer_features` (gated by `OPEN_FEATURE_ENABLED`). Training/backtest need no
-  change — full history already has each row's real next-day open.
+**Removed from the working tree:**
+- open flag + `next_open_gap` (`config.py` Option 5, `feature_engineer.py`);
+- live open injection `fetch_todays_open` / `append_todays_open_row` (`data_fetcher.py`, `predict.py`);
+- oil columns + `CL=F` fetch (`config.py`, `macro_features.py`);
+- oil `--train` auto-refresh `ensure_macro_oil_cache` (`macro_features.py`),
+  `set_macro_frame_cache` (`data_fetcher.py`), and the `train.py` call.
 
-**2) Oil price (`oil_log_ret`, `oil_vol_annual_pct`)** — WTI front-month **`CL=F` via yfinance**
-(same source as the other macro features). Two market-wide columns, identical value per date for
-every ticker, mirroring the stock `log_ret` / `vol_annual_pct`:
-- `config.py`: appended `oil_log_ret`, `oil_vol_annual_pct` to `MACRO_FEATURE_COLUMNS` (now 8) and
-  `MACRO_FEATURE_NEUTRAL` (`0.0` / `35.0`). Gated by the existing `MACRO_FEATURES_ENABLED`.
-- `macro_features.py`: `build_macro_frame` fetches `CL=F` and adds
-  `oil_log_ret = ln(c/c.shift(1))`, `oil_vol_annual_pct = rolling_annualized_log_vol_pct(c)`
-  (reused from `feature_engineer`). Flows through the existing cache + per-ticker materialization.
-
-New flag (default = active on this branch):
-
-| Flag | Default | Effect |
-|------|---------|--------|
-| `OPEN_FEATURE_ENABLED` | `True` | Adds `next_open_gap` (today's open→prior-close gap) to the feature set |
-
-**Operational — `--train` is one command:** oil is materialized into the cache **automatically** at the
-start of training. `train_model()` calls `macro_features.ensure_macro_oil_cache()`, which rebuilds the
-market-wide frame (incl. `CL=F`) when stale, sets the in-process macro-frame cache
-(`data_fetcher.set_macro_frame_cache`), and backfills the oil columns into any per-symbol parquet whose
-schema is missing them (cheap pyarrow schema gate → first run rewrites ~199 parquets, later runs skip).
-```
-python -m stock_predictor.main --train                    # auto-refreshes oil, then 31-feature checkpoint (GPU desktop)
-```
-- `next_open_gap` needs no backfill (derived from cached OHLCV). The old 28-feature checkpoint is
-  auto-rejected by the existing `n_features` guard. Commit the regenerated parquets (as in Stage 5).
-- The standalone tool still works as an explicit/manual path (e.g. to refresh the cache without training):
-  `python -m stock_predictor.tools.backfill_macro_features`.
-- Refresh failures (e.g. offline) never block training — the feature layer falls back to neutral oil.
-- Not wired into `--backtest` / `--regime-backtest` / `--run` / walk-forward: they read whatever the
-  cache holds, so run `--train` (or the tool) first to populate oil.
-
-**Revert:** set `OPEN_FEATURE_ENABLED = False` **and** remove `oil_log_ret`/`oil_vol_annual_pct` from
-`MACRO_FEATURE_COLUMNS` (+ their neutral entries) → back to the 28-feature set; retrain (or restore
-the model backup).
+**State:** retrain the 28-feature model (`python -m stock_predictor.main --train`, GPU desktop); the
+`n_features` guard auto-rejects the stale 31-feature checkpoint. Parquets written during the 31-feature
+retrain carry two inert `oil_*` columns — ignored (not in `FEATURE_COLUMNS`), clear on next cache rebuild.

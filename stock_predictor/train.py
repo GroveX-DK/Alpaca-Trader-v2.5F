@@ -251,16 +251,6 @@ def train_model() -> None:
 
     cfg = config
 
-    # Sørg for at makro-/olie-kolonnerne er materialiseret i cachen, før features bygges, så
-    # `--train` er én kommando (oliedata behøver ikke en separat backfill). Fejl her må aldrig
-    # blokere træning — uden olie-kolonner falder feature-laget neutralt tilbage.
-    try:
-        from stock_predictor.macro_features import ensure_macro_oil_cache
-
-        ensure_macro_oil_cache()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Makro-/olie-cache-refresh sprunget over: %s", exc)
-
     calendar_days = int(cfg.TRAINING_YEARS * 366 + cfg.FETCH_EXTRA_DAYS)
 
     # prefer_cache_only=False: tjek Alpaca for nye barer og opdatér cachen før træning;
