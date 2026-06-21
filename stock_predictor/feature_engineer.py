@@ -51,15 +51,8 @@ _BASE_FEATURE_COLUMNS: tuple[str, ...] = (
     "news_sentiment",
 )
 
-# Markeds-brede makro-kolonner (krise-signaler) appendes KUN når flag er til, så
-# flag fra => uændret 22-feature-sæt. config ejer navnene; her ejes beregningen.
-_MACRO_FEATURE_COLUMNS: tuple[str, ...] = tuple(getattr(config, "MACRO_FEATURE_COLUMNS", ()))
-
-# Autoritativ feature-liste (skal matche config.N_FEATURES). Dynamisk efter flag,
-# så engineer_features og scaler/model altid er enige om kolonnesættet.
-FEATURE_COLUMNS: tuple[str, ...] = _BASE_FEATURE_COLUMNS + (
-    _MACRO_FEATURE_COLUMNS if getattr(config, "MACRO_FEATURES_ENABLED", False) else ()
-)
+# Autoritativ feature-liste (skal matche config.N_FEATURES).
+FEATURE_COLUMNS: tuple[str, ...] = _BASE_FEATURE_COLUMNS
 
 
 def rolling_annualized_log_vol_pct(
@@ -230,17 +223,6 @@ def _feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     else:
         out["news_sentiment"] = 0.0
 
-    # Markeds-brede makro-/krise-signaler (samme mønster som vix_close): læs fra base-
-    # kolonnen hvis til stede (ffill), ellers neutralværdi — så rækker aldrig droppes.
-    # Beregnes altid; FEATURE_COLUMNS afgør om de faktisk indgår (flag-styret).
-    neutral = getattr(config, "MACRO_FEATURE_NEUTRAL", {})
-    for col in _MACRO_FEATURE_COLUMNS:
-        fill = float(neutral.get(col, 0.0))
-        if col in df.columns:
-            out[col] = pd.to_numeric(df[col], errors="coerce").ffill().fillna(fill)
-        else:
-            out[col] = fill
-
     return out[list(FEATURE_COLUMNS)]
 
 
@@ -258,27 +240,15 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 def build_dataset_frame(
     ohlcv: pd.DataFrame,
     vix_close: pd.Series | None = None,
-    macro: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
-    Fuldt datasæt til cache: OHLCV + vol_annual_pct + vix_close + (valgfri makro-
-    krise-signaler) + alle FEATURE_COLUMNS (uden dropna, så fuld historik bevares
-    med NaN-opvarmning).
-
-    ``macro``: markeds-bred frame (date-index) med kolonner i config.MACRO_FEATURE_COLUMNS.
-    Joines på base-index (ffill) som vix_close, så de materialiseres i cachen og bæres
-    med ved senere inkrementel merge. Manglende kolonner/dage fyldes neutralt i features.
+    Fuldt datasæt til cache: OHLCV + vol_annual_pct + vix_close + alle FEATURE_COLUMNS
+    (uden dropna, så fuld historik bevares med NaN-opvarmning).
     """
     base = ohlcv.sort_index().copy()
     if vix_close is not None:
         vix = pd.to_numeric(vix_close, errors="coerce")
         base["vix_close"] = vix.reindex(base.index).ffill()
-    if macro is not None and not macro.empty:
-        m = macro.sort_index()
-        m.index = pd.to_datetime(m.index)
-        for col in _MACRO_FEATURE_COLUMNS:
-            if col in m.columns:
-                base[col] = pd.to_numeric(m[col], errors="coerce").reindex(base.index).ffill()
     base["vol_annual_pct"] = rolling_annualized_log_vol_pct(base["close"])
     feats = _feature_frame(base)
     # Undgå dublerede kolonner (vix_close/makro findes både i base og feats).

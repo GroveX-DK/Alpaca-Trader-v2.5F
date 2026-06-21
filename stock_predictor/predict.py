@@ -45,58 +45,25 @@ def _load_bundle():
     logger.debug("Inference device: %s", device)
 
     ckpt = torch.load(ckpt_path, map_location=device)
-    n_outputs_ckpt = int(ckpt.get("n_outputs", 1))
     net = DailyLSTM(
         n_features=int(ckpt["n_features"]),
         hidden_size=int(ckpt["hidden"]),
         num_layers=int(ckpt["layers"]),
         dropout=float(ckpt["dropout"]),
-        n_outputs=n_outputs_ckpt,
     )
     net.load_state_dict(ckpt["state_dict"])
     net.to(device)
     net.eval()
-    # Kvantil-niveauer (eller None) bæres med på modellen til median/bånd-udtræk.
-    net._quantiles = ckpt.get("quantiles")
     n_features_ckpt = int(ckpt["n_features"])
     seq_len_ckpt = int(ckpt.get("seq_len", config.SEQ_LEN))
     return net, scaler, device, n_features_ckpt, seq_len_ckpt
 
 
-def quantile_indices(quantiles) -> tuple[int, int, int]:
-    """(median_idx, lav_idx, høj_idx) for et sæt kvantil-niveauer (fx 0.1/0.5/0.9)."""
-    qs = list(quantiles)
-    median_idx = min(range(len(qs)), key=lambda i: abs(qs[i] - 0.5))
-    lo_idx = min(range(len(qs)), key=lambda i: qs[i])
-    hi_idx = max(range(len(qs)), key=lambda i: qs[i])
-    return median_idx, lo_idx, hi_idx
+def _score_watchlist() -> dict:
+    """Scor hele watchlisten på nyeste vindue → score_map pr. symbol.
 
-
-def reduce_outputs(out: np.ndarray, model) -> tuple[np.ndarray, np.ndarray]:
-    """Reducér model-output (N, n_outputs) til (score, bånd) pr. række.
-
-    Punkt-estimat (n_outputs=1): score = output, bånd = 0. Kvantil-head: score = median
-    (q50), bånd = q_høj − q_lav (fx q90 − q10) — et datadrevet usikkerheds-mål til sizing.
-    """
-    out = np.asarray(out, dtype=np.float64)
-    if out.ndim == 1:
-        out = out.reshape(-1, 1)
-    n_out = out.shape[1]
-    if n_out == 1:
-        return out[:, 0], np.zeros(out.shape[0], dtype=np.float64)
-    quants = getattr(model, "_quantiles", None) or [
-        (i + 1) / (n_out + 1) for i in range(n_out)
-    ]
-    m_i, lo_i, hi_i = quantile_indices(quants)
-    return out[:, m_i], out[:, hi_i] - out[:, lo_i]
-
-
-def _score_watchlist() -> Tuple[dict, dict]:
-    """Scor hele watchlisten på nyeste vindue → (score_map, band_map) pr. symbol.
-
-    score: forudsagt næste dags open→close i procent (median når usikkerheds-head er aktivt).
-    band: q90 − q10 (0 for punkt-estimat). OHLCV hentes via fetch_daily_bars (samme sti som
-    træning); ved tail-API-fejl kan trimmed cache bruges som fallback.
+    score: forudsagt næste dags open→close i procent. OHLCV hentes via fetch_daily_bars
+    (samme sti som træning); ved tail-API-fejl kan trimmed cache bruges som fallback.
     """
     model, scaler, device, n_features_ckpt, ckpt_seq = _load_bundle()
 
@@ -129,7 +96,6 @@ def _score_watchlist() -> Tuple[dict, dict]:
         logger.warning("News-sentiment refresh sprunget over: %s", exc)
 
     score_map: dict[str, float] = {}
-    band_map: dict[str, float] = {}
 
     for sym in config.WATCHLIST:
         ohlcv = bars.get(sym)
@@ -171,57 +137,24 @@ def _score_watchlist() -> Tuple[dict, dict]:
         xt = xt.to(device)
         with torch.no_grad():
             out = model(xt).detach().cpu().numpy()
-        score, band = reduce_outputs(out, model)
-        score_map[sym] = float(score[0])
-        band_map[sym] = float(band[0])
+        score_map[sym] = float(out.reshape(-1)[0])
 
     if not score_map:
         raise RuntimeError("Alle symboler blev filtrede fra ved inference.")
-    return score_map, band_map
+    return score_map
 
 
 def predict_rankings() -> Tuple[str, float, List[Tuple[str, float]]]:
     """Returnér (bedste_symbol, score, fuld_ranking [(symbol, score)] faldende).
 
-    score = forudsagt næste dags open→close i pct (median når usikkerheds-head er aktivt).
+    score = forudsagt næste dags open→close i pct.
     """
-    score_map, _band = _score_watchlist()
+    score_map = _score_watchlist()
     ranked = sorted(score_map.items(), key=lambda kv: kv[1], reverse=True)
     best_sym, best_score = ranked[0]
     return best_sym, best_score, ranked
 
 
-def predict_rankings_detailed() -> List[Tuple[str, float, float]]:
-    """Fuld ranking som [(symbol, score, bånd)] faldende efter score.
-
-    ``bånd`` = q90 − q10 fra usikkerheds-head (0 for punkt-estimat-model). Bruges af den
-    long/short-traderen til konfidens-/vol-baseret sizing.
-    """
-    score_map, band_map = _score_watchlist()
-    rows = [(s, sc, float(band_map.get(s, 0.0))) for s, sc in score_map.items()]
-    rows.sort(key=lambda r: r[1], reverse=True)
-    return rows
-
-
-def predict_best_directional() -> Tuple[str, float, float, str]:
-    """Retningsbestemt valg: navnet med STØRST forudsagt |bevægelse|.
-
-    Returnér (symbol, score, bånd, side) hvor ``score`` er median-forudsigelsen (open→close %),
-    ``bånd`` = q90 − q10 (0 for punkt-estimat) og ``side`` = "long" hvis score ≥ 0 ellers
-    "short". Bruges af den retningsbestemte live-sti (DIRECTIONAL_LIVE_ENABLED).
-    """
-    score_map, band_map = _score_watchlist()
-    best_sym = max(score_map, key=lambda s: abs(score_map[s]))
-    score = float(score_map[best_sym])
-    band = float(band_map.get(best_sym, 0.0))
-    side = "long" if score >= 0.0 else "short"
-    return best_sym, score, band, side
-
-
 __all__ = [
     "predict_rankings",
-    "predict_rankings_detailed",
-    "predict_best_directional",
-    "reduce_outputs",
-    "quantile_indices",
 ]

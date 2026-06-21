@@ -49,7 +49,7 @@ from stock_predictor.feature_engineer import (  # noqa: E402
     engineer_features,
     targets_next_day_open_to_close_pct,
 )
-from stock_predictor.predict import _load_bundle, reduce_outputs  # noqa: E402
+from stock_predictor.predict import _load_bundle  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -149,15 +149,14 @@ def _predict_symbol(
     ohlcv: pd.DataFrame,
     year: int,
     end_year: int | None = None,
-) -> tuple[pd.Series, pd.Series, pd.Series] | None:
-    """Returnér (pred, actual, band) indekseret på handelsdato (t+1) for ét symbol.
+) -> tuple[pd.Series, pd.Series] | None:
+    """Returnér (pred, actual) indekseret på handelsdato (t+1) for ét symbol.
 
     Med kun ``year`` dækkes det ene kalenderår (uændret adfærd). Gives ``end_year`` dækkes
     hele intervallet [year, end_year] — brugt af den lange regime-backtest.
 
-    pred: modellens forudsagte open→close % (median når usikkerheds-head er aktivt).
+    pred: modellens forudsagte open→close %.
     actual: realiseret open→close % samme dag (facit fra targets_next_day_open_to_close_pct).
-    band: q90 − q10 usikkerhedsbånd (0 for punkt-estimat) til konfidens-sizing i long/short.
     """
     y0 = year
     y1 = end_year if end_year is not None else year
@@ -196,7 +195,6 @@ def _predict_symbol(
         return None
 
     preds: list[float] = []
-    bands: list[float] = []
     with torch.no_grad():
         for start in range(0, len(windows), INFER_BATCH):
             batch = windows[start : start + INFER_BATCH]
@@ -205,15 +203,12 @@ def _predict_symbol(
                 flat.reshape(len(batch), seq_len, n_features).astype(np.float32)
             ).to(device)
             out = model(xt).detach().cpu().numpy()
-            score, band = reduce_outputs(out, model)
-            preds.extend(float(v) for v in score)
-            bands.extend(float(v) for v in band)
+            preds.extend(float(v) for v in out.reshape(-1))
 
     idx = pd.DatetimeIndex(trade_dates)
     return (
         pd.Series(preds, index=idx),
         pd.Series(actuals, index=idx),
-        pd.Series(bands, index=idx),
     )
 
 
@@ -312,21 +307,14 @@ def _simulate(
     pred_df: pd.DataFrame,
     actual_df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, Dict[str, pd.Series]]:
-    """Dag-for-dag-simulering med ærlige handelsomkostninger.
+    """Kør dag-for-dag-simuleringen for top-3 strategierne.
 
-    "best": den retningsbestemte enkelt-navn-strategi (config.DIRECTIONAL_ENABLED) — vælg
-    navnet med STØRST forudsagt |bevægelse|, long hvis pred>0 og short hvis pred<0
-    (short-afkast = −realiseret). Konfidens-gaten DIRECTIONAL_MIN_ABS_PCT kan sætte dagen i
-    kontanter. Er flaget fra, er "best" det højeste long-pick (gammel adfærd). "second/third/
-    avg" er long-only-referencer (top-2/3 og ligevægtet snit) til sammenligning.
-
-    Alle handlende kurver trækkes en round-trip-omkostning (BACKTEST_COST_BPS_PER_SIDE × 2)
-    fra pr. dag, da strategien roterer ~100 %/dag. Returnér (daily_log, equities).
+    For hver handelsdag rangeres dagens forudsigelser faldende, og op til tre picks
+    med gyldigt facit (ikke-NaN actual) udvælges. Fire equity-kurver kompounderes fra
+    START_EQUITY: bedste/næstbedste/tredjebedste pick samt et ligevægtet snit af de
+    tilgængelige top-3. Mangler 2./3. pick en dag, føres den pågældende kurve uændret
+    videre (ingen handel). Returnér (daily_log, equities).
     """
-    directional = bool(getattr(config, "DIRECTIONAL_ENABLED", False))
-    min_abs = float(getattr(config, "DIRECTIONAL_MIN_ABS_PCT", 0.0))
-    rt_cost = 2.0 * float(getattr(config, "BACKTEST_COST_BPS_PER_SIDE", 0.0)) * 0.01  # round-trip i pct
-
     equity = {"best": START_EQUITY, "second": START_EQUITY, "third": START_EQUITY, "avg": START_EQUITY}
     rows: list[dict] = []
     points: dict[str, list[float]] = {k: [] for k in equity}
@@ -337,7 +325,7 @@ def _simulate(
         if valid.empty:
             continue
 
-        # Long top-3 referencer (uændret udvælgelse efter pred faldende).
+        # Saml op til tre picks med gyldigt facit, i rangordnet rækkefølge.
         picks: list[tuple[str, float, float]] = []
         for sym, pred_val in valid.items():
             realized = actual_df.loc[trade_date, sym]
@@ -349,53 +337,27 @@ def _simulate(
         if not picks:
             continue
 
-        # --- "best": retningsbestemt enkelt-navn (eller gammel top-long hvis flag fra) ---
-        if directional:
-            best_dir: tuple[str, float, float] | None = None
-            for sym, _abs_val in valid.abs().sort_values(ascending=False).items():
-                realized = actual_df.loc[trade_date, sym]
-                if pd.isna(realized):
-                    continue
-                best_dir = (str(sym), float(pred_row[sym]), float(realized))
-                break
-            if best_dir is None:
-                continue
-            b_sym, b_pred, b_act = best_dir
-            if abs(b_pred) < min_abs:
-                best_side = "CASH"      # konfidens-gate: ingen handel, ingen omkostning
-                best_signed = 0.0
-            else:
-                best_side = "LONG" if b_pred >= 0.0 else "SHORT"
-                gross = b_act if b_pred >= 0.0 else -b_act
-                best_signed = gross - rt_cost
-        else:
-            b_sym, b_pred, b_act = picks[0]
-            best_side = "LONG"
-            best_signed = b_act - rt_cost
-        equity["best"] *= 1.0 + best_signed / 100.0
-
-        # --- Long-only referencer (net for round-trip-omkostning når de handler) ---
+        # Kompoundér hver kurve (2./3. føres videre hvis pick mangler).
+        equity["best"] *= 1.0 + picks[0][2] / 100.0
         if len(picks) >= 2:
-            equity["second"] *= 1.0 + (picks[1][2] - rt_cost) / 100.0
+            equity["second"] *= 1.0 + picks[1][2] / 100.0
         if len(picks) >= 3:
-            equity["third"] *= 1.0 + (picks[2][2] - rt_cost) / 100.0
+            equity["third"] *= 1.0 + picks[2][2] / 100.0
         avg_realized = float(np.mean([p[2] for p in picks]))
-        equity["avg"] *= 1.0 + (avg_realized - rt_cost) / 100.0
+        equity["avg"] *= 1.0 + avg_realized / 100.0
 
         def _slot(i: int) -> tuple[str, float, float]:
             return picks[i] if len(picks) > i else ("", float("nan"), float("nan"))
 
-        is_cash = best_side == "CASH"
+        (b_sym, b_pred, b_act) = _slot(0)
         (s_sym, s_pred, s_act) = _slot(1)
         (t_sym, t_pred, t_act) = _slot(2)
         rows.append(
             {
                 "trade_date": trade_date.date().isoformat(),
-                "best_symbol": "" if is_cash else b_sym,
-                "best_side": best_side,
+                "best_symbol": b_sym,
                 "best_pred": round(b_pred, 4),
-                "best_actual": float("nan") if is_cash else round(b_act, 4),
-                "best_signed_actual": round(best_signed, 4),
+                "best_actual": round(b_act, 4),
                 "second_symbol": s_sym,
                 "second_pred": round(s_pred, 4) if np.isfinite(s_pred) else s_pred,
                 "second_actual": round(s_act, 4) if np.isfinite(s_act) else s_act,
@@ -417,81 +379,6 @@ def _simulate(
     idx = pd.DatetimeIndex(index)
     equities = {k: pd.Series(points[k], index=idx) for k in equity}
     return daily_log, equities
-
-
-# Rullende vindue (handelsdage) til realiseret-vol-estimatet i vol-targeting.
-_LS_VOL_WINDOW = 63
-
-
-def _simulate_long_short(
-    pred_df: pd.DataFrame,
-    actual_df: pd.DataFrame,
-    band_df: pd.DataFrame | None = None,
-) -> tuple[pd.Series, pd.Series]:
-    """Markeds-neutral long/short: long top-k, short bottom-k, dollar-neutral, vol-targeted.
-
-    Pr. dag rangeres dagens forudsigelser; de k højeste købes og de k laveste shortes
-    (ligevægt pr. ben). Rå dagsafkast (eksponering=1) = mean(long-facit) − mean(short-facit) i
-    pct. Eksponeringen skaleres så realiseret vol rammer LONG_SHORT_TARGET_VOL_PCT (forrige
-    dags vol → ingen look-ahead) og — når usikkerheds-head er aktivt — ned når båndet (q90−q10)
-    for de valgte navne er bredt. Loft = LONG_SHORT_MAX_GROSS. Returnér (equity, daglige %-afkast).
-    """
-    top_k = int(getattr(config, "LONG_SHORT_TOP_K", 5))
-    bot_k = int(getattr(config, "LONG_SHORT_BOTTOM_K", 5))
-    target_vol = float(getattr(config, "LONG_SHORT_TARGET_VOL_PCT", 15.0))
-    max_gross = float(getattr(config, "LONG_SHORT_MAX_GROSS", 1.0))
-
-    raw_returns: list[float] = []   # eksponering=1 dagsafkast (%)
-    day_bands: list[float] = []     # middel-bånd for valgte navne (usikkerhed)
-    dates: list[pd.Timestamp] = []
-
-    for trade_date, pred_row in pred_df.iterrows():
-        valid = pred_row.dropna().sort_values(ascending=False)
-        if len(valid) < top_k + bot_k:
-            continue
-        longs = list(valid.index[:top_k])
-        shorts = list(valid.index[-bot_k:])
-        act = actual_df.loc[trade_date]
-        long_act = pd.to_numeric(act[longs], errors="coerce").dropna()
-        short_act = pd.to_numeric(act[shorts], errors="coerce").dropna()
-        if long_act.empty or short_act.empty:
-            continue
-        raw = float(long_act.mean() - short_act.mean())  # dollar-neutral, eksponering=1
-        raw_returns.append(raw)
-        dates.append(trade_date)
-        if band_df is not None and trade_date in band_df.index:
-            b = pd.to_numeric(band_df.loc[trade_date, longs + shorts], errors="coerce").dropna()
-            day_bands.append(float(b.mean()) if not b.empty else float("nan"))
-        else:
-            day_bands.append(float("nan"))
-
-    if not raw_returns:
-        return pd.Series(dtype=float), pd.Series(dtype=float)
-
-    idx = pd.DatetimeIndex(dates)
-    raw = pd.Series(raw_returns, index=idx)
-    bands = pd.Series(day_bands, index=idx)
-
-    # Vol-targeting: forrige dags realiserede (annualiserede) vol af eksponering=1-afkast.
-    rv = raw.rolling(_LS_VOL_WINDOW, min_periods=10).std(ddof=1) * np.sqrt(_metrics.TRADING_DAYS_PER_YEAR)
-    rv_prev = rv.shift(1)
-    exposure = (target_vol / rv_prev).replace([np.inf, -np.inf], np.nan)
-    exposure = exposure.fillna(max_gross)
-
-    # Konfidens-sizing: skalér ned når båndet er bredt (kun når usikkerheds-head gav bånd).
-    if bands.notna().any() and float(np.nanmax(bands.to_numpy())) > 0:
-        ref = float(np.nanmedian(bands.dropna().to_numpy()))
-        conf = ref / (ref + bands.fillna(ref))
-    else:
-        conf = pd.Series(1.0, index=idx)
-
-    exposure = (exposure * conf).clip(lower=0.0, upper=max_gross)
-    # Round-trip-omkostning på brutto-eksponeringen (begge ben roterer dagligt). Skalerer med
-    # eksponering, så lav-eksponerings-dage koster mindre.
-    rt_cost = 2.0 * float(getattr(config, "BACKTEST_COST_BPS_PER_SIDE", 0.0)) * 0.01
-    ret = exposure * (raw - rt_cost)  # daglige %-afkast, net for omkostning
-    equity = (1.0 + ret / 100.0).cumprod() * START_EQUITY
-    return equity, ret
 
 
 def _read_model_params() -> dict:
@@ -581,7 +468,6 @@ def run_backtest(
 
     pred_cols: Dict[str, pd.Series] = {}
     actual_cols: Dict[str, pd.Series] = {}
-    band_cols: Dict[str, pd.Series] = {}
 
     for sym in config.WATCHLIST:
         ohlcv = bars.get(sym)
@@ -590,7 +476,7 @@ def run_backtest(
         res = _predict_symbol(model, scaler, device, n_features, seq_len, ohlcv, year)
         if res is None:
             continue
-        pred_cols[sym], actual_cols[sym], band_cols[sym] = res
+        pred_cols[sym], actual_cols[sym] = res
 
     if not pred_cols:
         raise RuntimeError("Ingen symboler gav forudsigelser for året — tjek cache-dækning.")
@@ -819,8 +705,7 @@ def plot_saved_backtest(
 
 # Korte labels + facit-kolonne pr. strategi til stats-boksen.
 _STRATEGY_STATS_COLS: dict[str, tuple[str, str]] = {
-    # "best" måles på det FAKTISK eksekverede afkast (retning + omkostning), ikke det rå træk.
-    "best": ("Bedste (retning, net)", "best_signed_actual"),
+    "best": ("Bedste", "best_actual"),
     "second": ("Næstbedste", "second_actual"),
     "third": ("Tredjebedste", "third_actual"),
     "avg": ("Snit top 3", "avg_actual"),
@@ -1006,8 +891,7 @@ def _regime_report(
     For hvert vindue skæres equity-kurven til [start, slut], og ``metrics.summarize`` giver
     Sharpe/Sortino/Calmar/MaxDD/afkast/hit-rate (+ turnover for best). Vinduer med < 5
     handelsdage i kurven springes over (fx regimer uden for det valgte interval). ``variant``
-    mærker rækkerne (fx "baseline" vs "vix_gated") så de to kan sammenlignes i samme tabel.
-    ``strategies`` vælger hvilke equity-nøgler der rapporteres (fx ("long_short",)).
+    mærker rækkerne, og ``strategies`` vælger hvilke equity-nøgler der rapporteres.
     """
     windows: list[tuple[str, str, pd.Timestamp, pd.Timestamp]] = []
     # Hele perioden først (window_type="overall") → samlet afkast/Sharpe/MaxDD pr. strategi.
@@ -1049,78 +933,10 @@ def _regime_report(
     return records
 
 
-def _market_vix_series(bars: dict) -> pd.Series:
-    """Saml én markeds-VIX-serie (date → vix_close) fra cache-rammerne.
-
-    VIX er markeds-bredt og ens på tværs af symboler; vi fletter et par lange historikker
-    sammen med ``combine_first`` for at fylde kalenderen. Returnér en sorteret serie (tom hvis
-    ingen ramme har vix_close).
-    """
-    vix: pd.Series | None = None
-    used = 0
-    for ohlcv in bars.values():
-        if ohlcv is None or "vix_close" not in getattr(ohlcv, "columns", []):
-            continue
-        s = pd.to_numeric(ohlcv["vix_close"], errors="coerce").dropna()
-        if s.empty:
-            continue
-        s = s[~s.index.duplicated(keep="last")]
-        vix = s if vix is None else vix.combine_first(s)
-        used += 1
-        if used >= 10:  # 10 symboler dækker kalenderen rigeligt
-            break
-    if vix is None:
-        return pd.Series(dtype=float)
-    vix.index = pd.to_datetime(vix.index)
-    return vix.sort_index()
-
-
-def _vix_gated_equities(
-    daily_log: pd.DataFrame,
-    vix_decision: pd.Series,
-    threshold: float,
-    strategies: tuple[str, ...] = _REGIME_STRATEGIES,
-) -> tuple[Dict[str, pd.Series], int, int]:
-    """Byg risk-off-equity: stå i kontanter (0 %) på dage hvor forrige dags VIX ≥ threshold.
-
-    Genbruger de daglige realiserede afkast fra ``daily_log`` (best_actual/avg_actual i pct),
-    nuller dem på risk-off-dage (kontant-dagen bevares i serien, så Sharpe er korrekt) og
-    kompounderer på ny fra START_EQUITY. ``vix_decision`` er VIX forrige handelsdag (ingen
-    look-ahead). Returnér (gated_equities, antal_kontantdage, antal_dage_i_alt).
-    """
-    # "best" gates på det eksekverede retnings-/net-afkast (best_signed_actual), så den
-    # VIX-gatede kurve matcher den retningsbestemte strategi (falder tilbage til best_actual).
-    best_col = "best_signed_actual" if "best_signed_actual" in daily_log.columns else "best_actual"
-    ret_cols = {"best": best_col, "avg": "avg_actual"}
-    if "trade_date" not in daily_log.columns:
-        return {}, 0, 0
-    dates = pd.DatetimeIndex(pd.to_datetime(daily_log["trade_date"]))
-    if vix_decision is None or vix_decision.empty:
-        risk_off = np.zeros(len(dates), dtype=bool)
-    else:
-        aligned = vix_decision.reindex(dates)
-        risk_off = (aligned >= float(threshold)).fillna(False).to_numpy()
-    n_cash = int(risk_off.sum())
-    n_total = int(len(dates))
-
-    gated: Dict[str, pd.Series] = {}
-    for strat in strategies:
-        col = ret_cols.get(strat)
-        if col is None or col not in daily_log.columns:
-            continue
-        r = pd.to_numeric(daily_log[col], errors="coerce").to_numpy(dtype=float)
-        r = np.where(np.isfinite(r), r, 0.0)
-        r_gated = np.where(risk_off, 0.0, r)  # kontant på risk-off-dage
-        eq = (1.0 + r_gated / 100.0).cumprod() * START_EQUITY
-        gated[strat] = pd.Series(eq, index=dates)
-    return gated, n_cash, n_total
-
-
 def run_regime_backtest(
     start_year: int = 2006,
     end_year: int = 2025,
     *,
-    vix_max: float | None = None,
     show_plot: bool = True,
     output_path: Path | None = None,
 ) -> dict:
@@ -1129,11 +945,7 @@ def run_regime_backtest(
     Ingen genoptræning og ingen omkostninger: modellen indlæses én gang og scorer hver dag i
     [start_year, end_year] fra disk-cachen. ``_simulate`` kompounderer equity-kurverne, og
     ``_regime_report`` opsummerer Sharpe/MaxDD/afkast pr. markedsregime + pr. kalenderår.
-
-    Risk-off-filter: ``vix_max`` (default config.VIX_RISK_OFF_THRESHOLD = 30) tilføjer en
-    "vix_gated"-variant der står i kontanter når forrige dags VIX ≥ tærsklen, så baseline og
-    filtreret strategi kan sammenlignes pr. regime i samme tabel (ingen look-ahead). Hurtig
-    (~2-4 t CPU) robusthedslæsning — se forbeholdene i ``_REGIME_LIMITATIONS``.
+    Hurtig (~2-4 t CPU) robusthedslæsning — se forbeholdene i ``_REGIME_LIMITATIONS``.
     """
     if end_year < start_year:
         raise ValueError("end_year skal være ≥ start_year.")
@@ -1162,7 +974,6 @@ def run_regime_backtest(
 
     pred_cols: Dict[str, pd.Series] = {}
     actual_cols: Dict[str, pd.Series] = {}
-    band_cols: Dict[str, pd.Series] = {}
     for sym in config.WATCHLIST:
         ohlcv = bars.get(sym)
         if ohlcv is None or ohlcv.empty:
@@ -1170,13 +981,12 @@ def run_regime_backtest(
         res = _predict_symbol(model, scaler, device, n_features, seq_len, ohlcv, start_year, end_year)
         if res is None:
             continue
-        pred_cols[sym], actual_cols[sym], band_cols[sym] = res
+        pred_cols[sym], actual_cols[sym] = res
     if not pred_cols:
         raise RuntimeError("Ingen symboler gav forudsigelser — tjek cache-dækning for perioden.")
 
     pred_df = pd.DataFrame(pred_cols).sort_index()
     actual_df = pd.DataFrame(actual_cols).reindex(pred_df.index)
-    band_df = pd.DataFrame(band_cols).reindex(pred_df.index) if band_cols else None
 
     # Min-symboler-pr-dag: drop dage hvor for få navne har gyldig forudsigelse (tyndt univers
     # i de tidlige år ville ellers give degenererede all-in-dage).
@@ -1186,8 +996,6 @@ def run_regime_backtest(
     dropped = int((~keep).sum())
     pred_df = pred_df.loc[keep]
     actual_df = actual_df.loc[keep]
-    if band_df is not None:
-        band_df = band_df.loc[keep]
     if pred_df.empty:
         raise RuntimeError(f"Ingen dage med ≥{min_syms} symboler — sænk MIN_SYMBOLS_PER_DAY eller start senere.")
     logger.info(
@@ -1199,50 +1007,13 @@ def run_regime_backtest(
     if daily_log.empty:
         raise RuntimeError("Simuleringen producerede ingen handler.")
 
-    # --- Risk-off VIX-filter: 'vix_gated'-variant der står i kontanter når VIX ≥ tærskel ---
-    threshold = float(vix_max) if vix_max is not None else float(
-        getattr(config, "VIX_RISK_OFF_THRESHOLD", 30.0)
-    )
-    vix = _market_vix_series(bars)
-    vix_decision = vix.shift(1) if not vix.empty else pd.Series(dtype=float)  # forrige dags close
-    gated_equities, n_cash, n_total = _vix_gated_equities(daily_log, vix_decision, threshold)
-    cash_share = round(100.0 * n_cash / max(1, n_total), 1)
-    if not gated_equities:
-        logger.warning("Ingen VIX-data i cachen — springer risk-off-filter over.")
-    else:
-        logger.info(
-            "VIX-filter (<%.0f): %s af %s dage i kontanter (%.1f%%).",
-            threshold, n_cash, n_total, cash_share,
-        )
-
-    records = _regime_report(equities, daily_log, start_year, end_year, variant="baseline")
-    if gated_equities:
-        records += _regime_report(gated_equities, daily_log, start_year, end_year, variant="vix_gated")
-
-    # --- Long/short markeds-neutral (Option 2): long top-k / short bottom-k, vol-targeted ---
-    ls_equities: Dict[str, pd.Series] = {}
-    if bool(getattr(config, "LONG_SHORT_ENABLED", False)):
-        ls_equity, ls_ret = _simulate_long_short(pred_df, actual_df, band_df)
-        if not ls_equity.empty:
-            ls_equities = {"long_short": ls_equity}
-            records += _regime_report(
-                ls_equities, daily_log, start_year, end_year,
-                variant="long_short", strategies=("long_short",),
-            )
-            logger.info(
-                "Long/short (top-%s/bottom-%s, vol-target %.0f%%): slut %+.1f%% over perioden.",
-                int(getattr(config, "LONG_SHORT_TOP_K", 5)),
-                int(getattr(config, "LONG_SHORT_BOTTOM_K", 5)),
-                float(getattr(config, "LONG_SHORT_TARGET_VOL_PCT", 15.0)),
-                (float(ls_equity.iloc[-1]) / START_EQUITY - 1.0) * 100.0,
-            )
-
+    records = _regime_report(equities, daily_log, start_year, end_year)
     params = _read_model_params()
 
-    # --- Hele perioden: samlet afkast for best/avg (+ VIX-filter) og SPY buy & hold ---
-    def _overall_ret(variant: str, strat: str):
+    # --- Hele perioden: samlet afkast for best/avg og SPY buy & hold ---
+    def _overall_ret(strat: str):
         r = next((x for x in records if x["window_type"] == "overall"
-                  and x["variant"] == variant and x["strategy"] == strat), None)
+                  and x["strategy"] == strat), None)
         return r["total_return_pct"] if r else None
 
     eq_index = equities["best"].index
@@ -1257,10 +1028,8 @@ def run_regime_backtest(
     overall = {
         "period_start": str(period_start),
         "period_end": str(period_end),
-        "best_total_return_pct": _overall_ret("baseline", "best"),
-        "avg_total_return_pct": _overall_ret("baseline", "avg"),
-        "best_vix_gated_total_return_pct": _overall_ret("vix_gated", "best"),
-        "avg_vix_gated_total_return_pct": _overall_ret("vix_gated", "avg"),
+        "best_total_return_pct": _overall_ret("best"),
+        "avg_total_return_pct": _overall_ret("avg"),
         "spy_total_return_pct": spy_total,
         "spy_covered_start": str(spy_cov_start.date()) if spy_cov_start is not None else None,
         "spy_covered_end": str(spy_cov_end.date()) if spy_cov_end is not None else None,
@@ -1279,9 +1048,6 @@ def run_regime_backtest(
         "start_year": start_year,
         "end_year": end_year,
         "min_symbols_per_day": min_syms,
-        "vix_threshold": threshold,
-        "vix_cash_days": n_cash,
-        "vix_cash_share_pct": cash_share,
         "overall": overall,
         "params": params,
         "limitations": _REGIME_LIMITATIONS,
@@ -1295,10 +1061,8 @@ def run_regime_backtest(
         return f"{v:+.1f}%" if isinstance(v, (int, float)) else "n/a"
 
     logger.info("=== Hele perioden %s..%s ===", period_start, period_end)
-    logger.info("  Bedste (top-1):  %8s   |  VIX-filter: %s",
-                _fmt(overall["best_total_return_pct"]), _fmt(overall["best_vix_gated_total_return_pct"]))
-    logger.info("  Snit top-3:      %8s   |  VIX-filter: %s",
-                _fmt(overall["avg_total_return_pct"]), _fmt(overall["avg_vix_gated_total_return_pct"]))
+    logger.info("  Bedste (top-1):  %8s", _fmt(overall["best_total_return_pct"]))
+    logger.info("  Snit top-3:      %8s", _fmt(overall["avg_total_return_pct"]))
     if spy_total is not None:
         cov = ""
         if spy_cov_start is not None and (spy_cov_start.date() > period_start or spy_cov_end.date() < period_end):
@@ -1307,31 +1071,25 @@ def run_regime_backtest(
     else:
         logger.info("  SPY buy & hold:  %8s  (ingen Alpaca-data/nøgler)", "n/a")
 
-    # Kort log-oversigt pr. regime: baseline vs VIX-filtreret (strategi=best).
-    _by = {(r["variant"], r["window"]): r for r in records
+    # Kort log-oversigt pr. regime (strategi=best): ret/Sharpe/MaxDD.
+    _by = {r["window"]: r for r in records
            if r["window_type"] == "regime" and r["strategy"] == "best"}
-    logger.info("--- Regime-nøgletal (best): baseline vs VIX<%.0f ---", threshold)
-    logger.info("%-22s %18s %18s", "regime", "baseline ret/Sh/DD", "vix_gated ret/Sh/DD")
+    logger.info("--- Regime-nøgletal (best): ret/Sharpe/MaxDD ---")
     for label, _s, _e, _stress in _REGIMES:
-        b = _by.get(("baseline", label))
-        g = _by.get(("vix_gated", label))
+        b = _by.get(label)
         if not b:
             continue
-        gstr = (f"{g['total_return_pct']:+6.1f}/{g['sharpe']:5.2f}/{g['max_drawdown_pct']:6.1f}"
-                if g else "        n/a")
         logger.info(
-            "%-22s %+6.1f/%5.2f/%6.1f   %s",
-            label, b["total_return_pct"], b["sharpe"], b["max_drawdown_pct"], gstr,
+            "%-22s %+6.1f / %5.2f / %6.1f",
+            label, b["total_return_pct"], b["sharpe"], b["max_drawdown_pct"],
         )
 
-    result = {"run_id": run_id, "equities": equities, "gated_equities": gated_equities,
-              "ls_equities": ls_equities, "records": records, "params": params,
-              "vix_threshold": threshold, "vix_cash_share_pct": cash_share, "overall": overall,
-              "benchmark": spy_equity, "csv_path": output_path, "json_path": json_path}
+    result = {"run_id": run_id, "equities": equities, "records": records, "params": params,
+              "overall": overall, "benchmark": spy_equity,
+              "csv_path": output_path, "json_path": json_path}
     if show_plot:
         _plot_regime(equities, records, start_year, end_year, run_id,
-                     gated_equities=gated_equities, vix_threshold=threshold, cash_share=cash_share,
-                     benchmark=spy_equity, overall=overall, ls_equities=ls_equities)
+                     benchmark=spy_equity, overall=overall)
     return result
 
 
@@ -1341,18 +1099,13 @@ def _plot_regime(
     start_year: int,
     end_year: int,
     run_id: str,
-    gated_equities: Dict[str, pd.Series] | None = None,
-    vix_threshold: float | None = None,
-    cash_share: float | None = None,
     benchmark: pd.Series | None = None,
     overall: dict | None = None,
-    ls_equities: Dict[str, pd.Series] | None = None,
 ) -> None:
     """Log-skala equity over hele historikken med skraverede stress-regimer + nøgletals-boks.
 
-    Med ``gated_equities`` overlejres VIX-filtreret 'best'-kurve (stiplet); ``benchmark`` (SPY
-    buy & hold) tegnes som grå stiplet linje, og ``overall`` (hovedtal for hele perioden) vises
-    i titlen, så best/avg/SPY ses side om side.
+    ``benchmark`` (SPY buy & hold) tegnes som grå stiplet linje, og ``overall`` (hovedtal for
+    hele perioden) vises i titlen, så best/avg/SPY ses side om side.
     """
     import matplotlib.pyplot as plt
 
@@ -1372,21 +1125,6 @@ def _plot_regime(
             ax.plot(bm.index, bm.values, label="SPY buy & hold", color="#888888",
                     linewidth=1.4, linestyle="--")
 
-    # Overlejr VIX-filtreret 'best' (stiplet) hvis tilgængelig.
-    if gated_equities:
-        gb = gated_equities.get("best")
-        if gb is not None and not gb.empty:
-            thr = f"<{vix_threshold:.0f}" if vix_threshold is not None else ""
-            ax.plot(gb.index, gb.values, label=f"Bedste, VIX-filter {thr}",
-                    color="#1f77b4", linewidth=1.6, linestyle="--")
-
-    # Overlejr long/short markeds-neutral (Option 2) hvis tilgængelig.
-    if ls_equities:
-        ls = ls_equities.get("long_short")
-        if ls is not None and not ls.empty:
-            ax.plot(ls.index, ls.values, label="Long/short (markeds-neutral)",
-                    color="#ff7f0e", linewidth=1.8, linestyle="-")
-
     # Skravér stress-regimer (kriser) der overlapper det viste interval.
     lo = pd.Timestamp(f"{start_year}-01-01")
     hi = pd.Timestamp(f"{end_year}-12-31")
@@ -1400,8 +1138,6 @@ def _plot_regime(
 
     ax.set_yscale("log")
     subtitle = f"kørsel {run_id}"
-    if cash_share is not None and vix_threshold is not None:
-        subtitle += f"   |   VIX-filter <{vix_threshold:.0f}: {cash_share:.0f}% af dage i kontanter"
     totals = ""
     if overall:
         def _t(v):
@@ -1419,26 +1155,16 @@ def _plot_regime(
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(loc="upper left")
 
-    # Nøgletals-boks: best pr. regime — Sharpe/MaxDD baseline vs VIX-filtreret.
+    # Nøgletals-boks: best pr. regime — Sharpe/MaxDD.
     base = {r["window"]: r for r in records
-            if r["window_type"] == "regime" and r["strategy"] == "best" and r.get("variant") == "baseline"}
-    gated = {r["window"]: r for r in records
-             if r["window_type"] == "regime" and r["strategy"] == "best" and r.get("variant") == "vix_gated"}
-    has_g = bool(gated)
-    header = (f"{'Regime':<20}{'Sh.base':>8}{'Sh.vix':>8}{'DD.base':>8}{'DD.vix':>8}"
-              if has_g else f"{'Regime':<20}{'Sharpe':>8}{'MaxDD':>8}")
+            if r["window_type"] == "regime" and r["strategy"] == "best"}
+    header = f"{'Regime':<20}{'Sharpe':>8}{'MaxDD':>8}"
     lines = [header, "-" * len(header)]
     for label, _s, _e, _stress in _REGIMES:
         b = base.get(label)
         if not b:
             continue
-        if has_g:
-            g = gated.get(label)
-            gs = f"{g['sharpe']:>8.2f}" if g else f"{'-':>8}"
-            gd = f"{g['max_drawdown_pct']:>7.1f}%" if g else f"{'-':>8}"
-            lines.append(f"{label[:20]:<20}{b['sharpe']:>8.2f}{gs}{b['max_drawdown_pct']:>7.1f}%{gd}")
-        else:
-            lines.append(f"{label[:20]:<20}{b['sharpe']:>8.2f}{b['max_drawdown_pct']:>7.1f}%")
+        lines.append(f"{label[:20]:<20}{b['sharpe']:>8.2f}{b['max_drawdown_pct']:>7.1f}%")
     ax.text(
         0.995, 0.02, "\n".join(lines), transform=ax.transAxes, ha="right", va="bottom",
         fontsize=7.0, family="monospace",

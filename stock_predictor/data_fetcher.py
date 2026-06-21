@@ -99,45 +99,19 @@ def _enrich_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return _with_vol_annual_pct(compute_watchlist_metrics(df))
 
 
-_MACRO_FRAME_CACHE: Optional[pd.DataFrame] = None
-_MACRO_FRAME_LOADED = False
-
-
-def _macro_frame_for_cache() -> Optional[pd.DataFrame]:
-    """Lazy-load den markeds-brede makro-frame (kun når MACRO_FEATURES_ENABLED).
-
-    Flag fra => None, så _dataset_for_cache opfører sig nøjagtig som før. Importen er
-    doven for at undgå cirkulær import (macro_features importerer fra data_fetcher).
-    """
-    global _MACRO_FRAME_CACHE, _MACRO_FRAME_LOADED
-    if not getattr(config, "MACRO_FEATURES_ENABLED", False):
-        return None
-    if not _MACRO_FRAME_LOADED:
-        try:
-            from stock_predictor.macro_features import load_macro_frame
-
-            _MACRO_FRAME_CACHE = load_macro_frame()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Kunne ikke indlæse makro-frame til cache: %s", exc)
-            _MACRO_FRAME_CACHE = None
-        _MACRO_FRAME_LOADED = True
-    return _MACRO_FRAME_CACHE
-
-
 def _dataset_for_cache(enriched: pd.DataFrame) -> pd.DataFrame:
     """
     Fuldt cache-datasæt der skrives til Parquet: OHLCV + Watchlist-metriker +
-    vol_annual_pct + vix_close (ffill) + (valgfri makro-krise-kolonner) + alle
-    stationære features (FEATURE_COLUMNS).
+    vol_annual_pct + vix_close (ffill) + alle stationære features (FEATURE_COLUMNS).
 
     Sikrer at de stationære feature-kolonner forbliver materialiseret i cachen efter
     inkrementel tail/backfill (ellers ville et gem via _enrich_ohlcv tabe dem). Nye barer
-    uden frisk ^VIX/makro arver seneste kendte værdi via ffill i build_dataset_frame.
+    uden frisk ^VIX arver seneste kendte værdi via ffill i build_dataset_frame.
     """
     if enriched.empty:
         return enriched
     vix = enriched["vix_close"] if "vix_close" in enriched.columns else None
-    return build_dataset_frame(enriched, vix, _macro_frame_for_cache())
+    return build_dataset_frame(enriched, vix)
 
 
 def _read_cache_parquet(path: Path) -> Optional[pd.DataFrame]:
@@ -157,11 +131,8 @@ def _read_cache_parquet(path: Path) -> Optional[pd.DataFrame]:
         for col in ("open", "high", "low", "close", "volume"):
             if col not in df.columns:
                 return None
-        # Valgfri kilde-/eksternkolonner der skal bæres med (ud over OHLCV): vol/vix/news
-        # samt de markeds-brede makro-krise-kolonner, så engineer_features ser dem.
-        optional_cols = ("vol_annual_pct", "vix_close", "news_sentiment") + tuple(
-            getattr(config, "MACRO_FEATURE_COLUMNS", ())
-        )
+        # Valgfri kilde-/eksternkolonner der skal bæres med (ud over OHLCV): vol/vix/news.
+        optional_cols = ("vol_annual_pct", "vix_close", "news_sentiment")
         cols = ["open", "high", "low", "close", "volume"]
         for opt in optional_cols:
             if opt in df.columns:

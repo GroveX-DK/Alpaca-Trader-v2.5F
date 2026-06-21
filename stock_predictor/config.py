@@ -232,12 +232,6 @@ WATCHLIST = [
     "D",      # Dominion Energy
     "EXC",    # Exelon
 ]
-# Sekvenslængde til LSTM'en. Tidligere 2000 (~8 år): et urealistisk langt vindue til at
-# forudsige ÉN næste-dags bevægelse — gradienter forsvinder over så mange skridt, signalet
-# (de seneste dage/uger) drukner, og hver epoch tog ~7 t på CPU, hvilket tvang EPOCHS=1.
-# ~40 handelsdage (~2 mdr) giver en lærbar horisont, ~10× hurtigere epochs og langt mindre
-# vindues-overlap (mindre overfit pr. epoch). OBS: ændring kræver fuld genoptræning
-# (checkpoint gemmer seq_len og inferens validerer mod det).
 LOOKBACK_DAYS = 2000
 SEQ_LEN = LOOKBACK_DAYS
 FETCH_EXTRA_DAYS = 60
@@ -253,10 +247,7 @@ INFERENCE_FETCH_CALENDAR_DAYS = (
 )
 
 TRAINING_YEARS = 10
-# Basis-feature-antal (FEATURE_COLUMNS uden makro). Det effektive N_FEATURES sættes
-# længere nede afhængigt af MACRO_FEATURES_ENABLED (krise-robusthed-sektionen).
-_BASE_N_FEATURES = 22
-N_FEATURES = _BASE_N_FEATURES
+N_FEATURES = 22
 NEWS_SENTIMENT_HISTORY_START = date(2015, 1, 1)
 NEWS_CACHE_DIR = _PKG_ROOT / "cache" / "news"
 NEWS_AUTO_REFRESH_ENABLED = True
@@ -289,9 +280,6 @@ SAVE_MODEL_ONLY_IF_BETTER_THAN_DISK = True
 # Mindste antal symboler med gyldig forudsigelse en dag skal have i regime-backtesten,
 # så det tynde tidlige univers ikke giver degenererede all-in-dage.
 MIN_SYMBOLS_PER_DAY = 10
-# Risk-off-filter i regime-backtesten: handl kun når VIX (forrige dags close) er UNDER denne
-# tærskel; ellers stå i kontanter (0 % den dag). 30 ≈ klassisk "stress"-niveau.
-VIX_RISK_OFF_THRESHOLD = 30.0
 CACHE_DIR = _PKG_ROOT / "cache"
 OHLCV_CACHE_ENABLED = True
 # OHLCV-prisjustering: "all" (split+udbytte, total-return) | "split" | "raw".
@@ -316,99 +304,3 @@ LR_SCHEDULER_FACTOR = 0.5
 # Reager hurtigere på val-plateau (var 5) så LR skæres ned før modellen begynder at divergere.
 LR_SCHEDULER_PATIENCE = 5
 LR_SCHEDULER_MIN_LR = 1e-6
-
-# ============================================================================
-# Krise-robusthed (branch: crisis-robustness)
-# ALLE flag herunder defaulter til den NUVÆRENDE adfærd, så pipelinen er uændret
-# indtil et flag slås til. Det er den "bløde" revert-sti: sæt alt til False og
-# systemet opfører sig som før. Fuld ændringslog + revert-kommandoer:
-# docs/CRISIS_ROBUSTNESS_CHANGES.md.
-# ============================================================================
-
-# --- Option 3: markeds-brede krise-signal-features (VIX-termstruktur, breadth,
-#     tværsnits-korrelation, kreditspænd, bond-vol/put-call). Slået fra => det
-#     nuværende feature-sæt (FEATURE_COLUMNS). Når True forventes N_FEATURES at
-#     matche len(FEATURE_COLUMNS) inkl. de nye makro-kolonner.
-MACRO_FEATURES_ENABLED = True
-# Cache-fil for den samlede markeds-brede makro-frame (date -> kolonner).
-MACRO_CACHE_PATH = CACHE_DIR / "macro" / "macro_features.parquet"
-# Rullende vindue til breadth (% over glidende gennemsnit) og tværsnits-korrelation.
-MACRO_BREADTH_MA_DAYS = 200
-MACRO_CORR_WINDOW_DAYS = 21
-# De markeds-brede makro-kolonner (samme for alle symboler, gemt som vix_close).
-# Rækkefølgen er autoritativ og appendes til FEATURE_COLUMNS når flag er til.
-# Neutralværdi pr. kolonne bruges når kilden mangler (ingen drop af rækker).
-MACRO_FEATURE_COLUMNS = (
-    "vix_ts_slope",       # ^VIX / ^VIX3M (>1 = backwardation/panik)
-    "vvix_level",         # ^VVIX / 100 (vol-of-vol)
-    "breadth_pct",        # andel af watchlist over 200d MA (0..1)
-    "xsec_corr",          # middel parvis korrelation af 21d-afkast (0..1)
-    "credit_ratio_chg",   # 5d pct-ændring i HYG/LQD (negativ i stress)
-    "move_chg",           # 5d pct-ændring i ^MOVE (positiv i bond-stress)
-)
-MACRO_FEATURE_NEUTRAL = {
-    "vix_ts_slope": 1.0,
-    "vvix_level": 0.9,
-    "breadth_pct": 0.5,
-    "xsec_corr": 0.3,
-    "credit_ratio_chg": 0.0,
-    "move_chg": 0.0,
-}
-
-# Effektivt feature-antal: basis + makro når slået til. Checkpoint gemmer dette tal,
-# og inferens validerer mod det — flag fra => uændret 22-feature-model.
-N_FEATURES = _BASE_N_FEATURES + (len(MACRO_FEATURE_COLUMNS) if MACRO_FEATURES_ENABLED else 0)
-
-# --- Option 4A: krise-oversampling — vægt træningsdage efter VIX, så modellen ser
-#     krak-regimer oftere (WeightedRandomSampler). VIX_REF er niveauet hvor vægt ~1.
-CRISIS_OVERSAMPLE_ENABLED = True
-CRISIS_OVERSAMPLE_VIX_REF = 20.0
-# Var 5.0: kraftig oversampling skævvrider train-fordelingen ift. det (uvægtede) seneste
-# val-vindue og bidrager til at val stiger tidligt. 2.5 beholder krise-fokus mere nænsomt.
-CRISIS_OVERSAMPLE_MAX_WEIGHT = 5
-
-# --- Option 4B: usikkerheds-head — modellen forudsiger kvantiler (10/50/90) frem
-#     for ét punkt-estimat. Score = median (q50); konfidensbånd = q90 - q10.
-#     Slået fra => head = Linear(hidden, 1) + HuberLoss (uændret).
-UNCERTAINTY_HEAD_ENABLED = True
-UNCERTAINTY_QUANTILES = (0.1, 0.5, 0.9)
-
-# --- Option 4C: walk-forward genoptræning (TUNG — ~hundredvis af CPU-timer;
-#     anbefales kun på GPU). Default fra.
-WALK_FORWARD_ENABLED = False
-WALK_FORWARD_TRAIN_MIN_YEARS = 8   # mindste træningsvindue før første OOS-år
-WALK_FORWARD_STEP_YEARS = 1        # antal år pr. OOS-skridt
-
-# --- Option 2: long/short markeds-neutral i backtesten. Long top-k, short bottom-k,
-#     dollar-neutral; brutto-eksponering skaleres af vol-target og (når
-#     usikkerheds-head er til) konfidensbåndet.
-LONG_SHORT_ENABLED = True
-LONG_SHORT_TOP_K = 5
-LONG_SHORT_BOTTOM_K = 5
-LONG_SHORT_TARGET_VOL_PCT = 15.0   # årlig vol-target for daglige strategi-afkast
-LONG_SHORT_MAX_GROSS = 1.0         # loft på brutto (long+short) som andel af equity
-# --- Option 2 (live): long/short i paper-traderen. Default fra => --run bevarer den
-#     nuværende enkelt-symbol-rotation (rotate_to_symbol).
-LONG_SHORT_LIVE_ENABLED = False
-
-# ============================================================================
-# Retningsbestemt enkelt-navn-strategi ("bedste aktie uanset hvad", men long hvis
-# den forudsagte bevægelse er op og short hvis den er ned) + ærlige handelsomkostninger.
-# ============================================================================
-
-# --- Retningsbestemt udvælgelse i backtesten (_simulate): vælg navnet med den STØRSTE
-#     forudsagte ABSOLUTTE bevægelse; long hvis pred>0, short hvis pred<0 (short-afkast =
-#     -realiseret). Fra => gammel adfærd (højeste pred, kun long).
-DIRECTIONAL_ENABLED = True
-# Konfidens-gate: handl kun når |pred| (forudsagt %) er mindst dette. 0.0 = handl altid
-# ("bedste aktie uanset hvad"). Hæv (fx 0.3) for at stå i kontanter på lav-konfidens-dage.
-DIRECTIONAL_MIN_ABS_PCT = 0.0
-# --- Retningsbestemt enkelt-navn LIVE i paper-traderen (rotate_to_symbol med side).
-#     Default fra => --run bevarer ren long-rotation indtil du slår dette til.
-DIRECTIONAL_LIVE_ENABLED = False
-
-# --- Handelsomkostninger i backtesten (spread+slippage+kurtage) pr. ben i basispoint.
-#     Strategien roterer ~100 %/dag, så omkostninger er afgørende for et ærligt facit.
-#     Lægges på hver entry og exit (round-trip = 2×). Sæt 0.0 for det gamle brutto-tal.
-#     5 bp/ben ≈ 0,10 % round-trip ~ realistisk for likvide mega-caps på Alpaca.
-BACKTEST_COST_BPS_PER_SIDE = 5.0

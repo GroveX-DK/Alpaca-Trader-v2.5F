@@ -22,7 +22,6 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from stock_predictor import config  # noqa: E402
 from stock_predictor.backtest import (  # noqa: E402
     list_saved_backtests,
     plot_saved_backtest,
@@ -94,16 +93,6 @@ def _parse_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[str]]:
             "Vis en liste over gemte backtests (output/backtests/) med deres parametre, "
             "vælg én, og genåbn dens graf uden at køre simuleringen igen. SPY buy & hold-"
             "benchmark hentes live på ny. Angiv valgfrit et ÅR for kun at vise det års kørsler."
-        ),
-    )
-    grp.add_argument(
-        "--walk-forward",
-        action="store_true",
-        help=(
-            "Walk-forward genoptræning (Option 4C): genoptræn modellen pr. år på et "
-            "ekspanderende vindue og scor hvert år out-of-sample, stitch til én equity-kurve. "
-            "Kræver WALK_FORWARD_ENABLED=True. TUNG (~mange træninger) — kør helst på GPU. "
-            "Gemmer output/backtests/walkforward_*.csv/.json og viser graf."
         ),
     )
     grp.add_argument(
@@ -185,12 +174,6 @@ def main(argv: list[str] | None = None) -> int:
         train_model()
         return 0
 
-    if args.walk_forward:
-        from stock_predictor.train import train_model_walk_forward
-
-        train_model_walk_forward()
-        return 0
-
     if args.backtest:
         run_backtest()
         return 0
@@ -204,42 +187,6 @@ def main(argv: list[str] | None = None) -> int:
         return _show_backtest(year_filter)
 
     logger = logging.getLogger(__name__)
-
-    # Long/short markeds-neutral live-bog (Option 2) når slået til; ellers enkelt-symbol-rotation.
-    if bool(getattr(config, "LONG_SHORT_LIVE_ENABLED", False)):
-        from stock_predictor.config import LONG_SHORT_BOTTOM_K, LONG_SHORT_TOP_K
-        from stock_predictor.predict import predict_rankings_detailed
-        from stock_predictor.trader import rebalance_long_short
-
-        ranked = predict_rankings_detailed()  # [(sym, score, band)] faldende
-        if len(ranked) < LONG_SHORT_TOP_K + LONG_SHORT_BOTTOM_K:
-            logger.error(
-                "For få symboler (%s) til long/short (kræver top-%s + bottom-%s).",
-                len(ranked), LONG_SHORT_TOP_K, LONG_SHORT_BOTTOM_K,
-            )
-            return 1
-        longs = [(s, sc) for s, sc, _b in ranked[:LONG_SHORT_TOP_K]]
-        shorts = [(s, sc) for s, sc, _b in ranked[-LONG_SHORT_BOTTOM_K:]]
-        logger.info(
-            "Long/short: long %s | short %s",
-            [s for s, _ in longs], [s for s, _ in shorts],
-        )
-        rebalance_long_short(longs, shorts)
-        return 0
-
-    # Retningsbestemt enkelt-navn (bedste |bevægelse|: long ved op, short ved ned) når slået til.
-    if bool(getattr(config, "DIRECTIONAL_LIVE_ENABLED", False)):
-        from stock_predictor.predict import predict_best_directional
-
-        best_sym, score, _band, side = predict_best_directional()
-        logger.info(
-            "Retningsbestemt valg: %s %s (forudsagt open→close %+f pct, største |bevægelse|).",
-            best_sym,
-            side.upper(),
-            score,
-        )
-        rotate_to_symbol(best_sym, float(score), side=side)
-        return 0
 
     best_sym, score, ranking = predict_rankings()
     logger.info(
