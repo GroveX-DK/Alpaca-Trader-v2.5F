@@ -84,6 +84,21 @@ def _parse_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[str]]:
         ),
     )
     grp.add_argument(
+        "--cpcv-backtest",
+        type=int,
+        metavar="START_ÅR",
+        nargs="?",
+        const=-1,
+        help=(
+            "Combinatorial Purged Cross-Validation (holdbarhed): GENOPTRÆN modellen pr. "
+            "fold-kombination (N=6, k=2 → 15 træninger / 5 OOS-stier) med purge+embargo og "
+            "rapportér FORDELINGEN af OOS Sharpe/afkast/MaxDD + P(Sharpe≤0). DYRT — kør på "
+            "GPU-desktop (config.TRAIN_DEVICE). Uden START_ÅR auto-detekteres det tidligste "
+            "brugbare år (afbryder hvis cachen er for tynd ift. SEQ_LEN — backfill da fuld "
+            "historik med tools.gather_history_yfinance). Gemmer output/backtests/cpcv_*.csv/.json."
+        ),
+    )
+    grp.add_argument(
         "--show-backtest",
         type=int,
         metavar="ÅR",
@@ -180,6 +195,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.regime_backtest is not None:
         run_regime_backtest(start_year=args.regime_backtest)
+        return 0
+
+    if args.cpcv_backtest is not None:
+        from stock_predictor.cpcv import run_cpcv_backtest
+
+        # const=-1 (flag uden årstal) → auto-detektér start_year.
+        start_year = None if args.cpcv_backtest == -1 else args.cpcv_backtest
+        run_cpcv_backtest(start_year=start_year)
         return 0
 
     if args.show_backtest is not None:

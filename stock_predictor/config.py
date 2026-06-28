@@ -232,7 +232,7 @@ WATCHLIST = [
     "D",      # Dominion Energy
     "EXC",    # Exelon
 ]
-LOOKBACK_DAYS = 2000
+LOOKBACK_DAYS = 1000
 SEQ_LEN = LOOKBACK_DAYS
 FETCH_EXTRA_DAYS = 60
 FEATURE_WARMUP_TRADING_DAYS = 35
@@ -304,3 +304,10 @@ LR_SCHEDULER_FACTOR = 0.5
 # Reager hurtigere på val-plateau (var 5) så LR skæres ned før modellen begynder at divergere.
 LR_SCHEDULER_PATIENCE = 5
 LR_SCHEDULER_MIN_LR = 1e-6
+# CPCV (Combinatorial Purged Cross-Validation) — holdbarheds-backtest med genoptræning pr.
+# fold-kombination. N grupper, k test-grupper → C(N,k) genoptræninger, φ=C(N,k)·k/N stier.
+# N=6,k=2 = 15 genoptræninger / 5 stier (López de Prado-default). DYRT: kør på GPU-desktop.
+CPCV_N_GROUPS = 6
+CPCV_K_TEST = 2
+# Embargo (kalenderdage) efter hver test-blok oven i SEQ_LEN-purge — dæmper seriel label-leakage.
+CPCV_EMBARGO_DAYS = 10

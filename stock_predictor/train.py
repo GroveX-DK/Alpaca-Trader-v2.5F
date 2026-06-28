@@ -189,83 +189,30 @@ class WindowDataset(Dataset):
         return xt, yt
 
 
-def train_model() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+def _fit_lstm(
+    scaled_by_sym: dict[str, np.ndarray],
+    train_recs: List[WindowRec],
+    val_recs: List[WindowRec],
+    *,
+    device: torch.device,
+    seq_len: int,
+    n_features: int,
+    epochs: int | None = None,
+    log_prefix: str = "",
+) -> Tuple[nn.Module, float, bool, bool]:
+    """Træn en frisk DailyLSTM på de givne vinduer.
 
-    random.seed(config.RANDOM_SEED)
-    np.random.seed(config.RANDOM_SEED)
-    torch.manual_seed(config.RANDOM_SEED)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(config.RANDOM_SEED)
+    Ren beregning: ingen disk-I/O og ingen "gem kun hvis bedre"-logik (det ligger i
+    ``train_model``). Genbruges af CPCV-backtesten, der træner én model pr. fold-kombination.
 
+    Returnerer ``(model, best_val, had_best, interrupted)``:
+    - ``model``: med de bedste val-vægte indlæst (hvis der var et val-sæt), ellers sidste vægte.
+    - ``best_val``: bedste val-loss (``inf`` hvis intet val-sæt / ingen forbedring).
+    - ``had_best``: om et bedste val-state blev fanget (styrer gem-gating hos kalderen).
+    - ``interrupted``: om træningen blev afbrudt med Ctrl+C.
+    """
     cfg = config
-
-    calendar_days = int(cfg.TRAINING_YEARS * 366 + cfg.FETCH_EXTRA_DAYS)
-
-    # prefer_cache_only=False: tjek Alpaca for nye barer og opdatér cachen før træning;
-    # falder tilbage til (evt. forældet) cache hvis API mangler nøgler eller fejler.
-    fetch_result = fetch_daily_bars(
-        cfg.ALPACA_API_KEY,
-        cfg.ALPACA_SECRET_KEY,
-        cfg.WATCHLIST,
-        end=None,
-        lookback_calendar_days=calendar_days,
-        extra_buffer_days=0,
-        prefer_cache_only=False,
-    )
-    bars = fetch_result.bars
-    if fetch_result.cache_only:
-        logger.info(
-            "Træningsdata kun fra disk-cache (%s symboler; sidste bar %s).",
-            len(bars),
-            fetch_result.required_end,
-        )
-    if not bars:
-        logger.error("Intet historisk data til træning. Afslutter.")
-        return
-
-    # Auto-opdatér nyere nyheds-sentiment (finBERT) ind i bars før features bygges.
-    try:
-        from stock_predictor.news_sentiment import refresh_watchlist
-
-        refresh_watchlist(cfg.ALPACA_API_KEY, cfg.ALPACA_SECRET_KEY, list(bars.keys()), bars)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("News-sentiment refresh sprunget over: %s", exc)
-
-    data_by_sym = _engineer_all(bars, cfg.SEQ_LEN)
-    if not data_by_sym:
-        logger.error("Ingen symboler med nok historik til træning. Afslutter.")
-        return
-    recs = _build_index(data_by_sym, cfg.SEQ_LEN)
-    if not recs:
-        logger.error("Ingen træningssekvenser kunne bygges. Afslutter.")
-        return
-    if len(recs) < 100:
-        logger.warning(
-            "Kun %s observationer til træning — resultat kan være ustabilt.",
-            len(recs),
-        )
-
-    train_recs, val_recs = _time_sort_split(recs, cfg.VAL_RATIO)
-    if not train_recs:
-        logger.error("Tom træningsmængde efter split. Afslutter.")
-        return
-    # Valgfri trænings-stride (kun træningssættet; val beholdes i fuld tæthed).
-    stride = int(getattr(cfg, "TRAIN_WINDOW_STRIDE", 1))
-    if stride > 1:
-        before = len(train_recs)
-        train_recs = _subsample_train_stride(train_recs, stride)
-        logger.info("Trænings-stride=%s: %s → %s vinduer.", stride, before, len(train_recs))
-    # RobustScaler (median/IQR): robust over for de fede haler i log-afkast/volumen-delta.
-    # Fit kun på unikke træningsrækker; skalér derefter hvert symbols matrix én gang.
-    scaler = _fit_scaler(data_by_sym, train_recs, cfg.N_FEATURES)
-    scaled_by_sym = _scale_all(data_by_sym, scaler, cfg.N_FEATURES)
-
-    del data_by_sym  # rå float32-matricer behøves ikke længere
-
-    train_pref = getattr(cfg, "TRAIN_DEVICE", "auto")
-    device = resolve_device(str(train_pref))
-    logger.info("Træningsenhed: %s", device)
+    epochs = int(cfg.EPOCHS if epochs is None else epochs)
 
     use_amp = bool(getattr(cfg, "TRAIN_AMP", True)) and device_supports_amp(device)
     if bool(getattr(cfg, "TRAIN_AMP", True)) and not use_amp:
@@ -277,11 +224,11 @@ def train_model() -> None:
     else:
         scaler_amp = None
 
-    model = DailyLSTM(
-        n_features=config.N_FEATURES,
-        hidden_size=config.LSTM_HIDDEN,
-        num_layers=config.LSTM_LAYERS,
-        dropout=config.DROPOUT,
+    model: nn.Module = DailyLSTM(
+        n_features=n_features,
+        hidden_size=cfg.LSTM_HIDDEN,
+        num_layers=cfg.LSTM_LAYERS,
+        dropout=cfg.DROPOUT,
     ).to(device)
 
     if bool(getattr(cfg, "TORCH_COMPILE_TRAIN", False)):
@@ -292,7 +239,7 @@ def train_model() -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning("torch.compile fejlede, fortsætter uden: %s", exc)
 
-    criterion = nn.HuberLoss(delta=float(config.HUBER_DELTA))
+    criterion = nn.HuberLoss(delta=float(cfg.HUBER_DELTA))
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
 
     lr_sched_enabled = bool(getattr(cfg, "LR_SCHEDULER_ENABLED", True)) and bool(val_recs)
@@ -311,8 +258,8 @@ def train_model() -> None:
     pin_memory = device.type == "cuda"
     num_workers = int(getattr(cfg, "TRAIN_NUM_WORKERS", 0))
 
-    train_ds = WindowDataset(scaled_by_sym, train_recs, cfg.SEQ_LEN)
-    val_ds = WindowDataset(scaled_by_sym, val_recs, cfg.SEQ_LEN) if val_recs else None
+    train_ds = WindowDataset(scaled_by_sym, train_recs, seq_len)
+    val_ds = WindowDataset(scaled_by_sym, val_recs, seq_len) if val_recs else None
 
     train_dl = DataLoader(
         train_ds,
@@ -338,32 +285,8 @@ def train_model() -> None:
     epochs_no_improve = 0
     patience = int(getattr(cfg, "EARLY_STOP_PATIENCE", 20))
 
-    disk_best_val = float("inf")
-    if cfg.MODEL_PATH.is_file():
-        try:
-            prev = torch.load(cfg.MODEL_PATH, map_location=device)
-            if isinstance(prev, dict) and "best_val_mse" in prev:
-                disk_best_val = float(prev["best_val_mse"])
-                prev_n = int(prev["n_features"]) if "n_features" in prev else None
-                # Skift i feature-antal gør disk-tabet usammenligneligt — nulstil baseline
-                # så den nye arkitektur kan gemmes.
-                if prev_n is not None and prev_n != int(cfg.N_FEATURES):
-                    disk_best_val = float("inf")
-                    logger.warning(
-                        "Checkpoint på disk har n_features=%s men config har %s — "
-                        "behandler som ingen baseline (ny model gemmes hvis val OK).",
-                        prev_n, cfg.N_FEATURES,
-                    )
-                else:
-                    logger.info(
-                        "Eksisterende checkpoint: best_val_mse=%.6f (ny model skal slå dette for at gemmes).",
-                        disk_best_val,
-                    )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Kunne ikke læse tidligere checkpoint: %s", exc)
-
     training_interrupted = False
-    for epoch in range(cfg.EPOCHS):
+    for epoch in range(epochs):
         try:
             model.train()
             total = 0.0
@@ -464,10 +387,11 @@ def train_model() -> None:
 
                 cur_lr = optimizer.param_groups[0]["lr"]
                 logger.info(
-                    "Epoch %s/%s train_loss=%.6f val_loss=%.6f val_dir_acc=%.1f%% val_ic=%+.3f "
+                    "%sEpoch %s/%s train_loss=%.6f val_loss=%.6f val_dir_acc=%.1f%% val_ic=%+.3f "
                     "lr=%.2e (patience %s/%s)",
+                    log_prefix,
                     epoch + 1,
-                    cfg.EPOCHS,
+                    epochs,
                     train_loss,
                     vloss,
                     dir_acc,
@@ -478,13 +402,14 @@ def train_model() -> None:
                 )
 
                 if epochs_no_improve >= patience:
-                    logger.info("Early stopping: ingen val-forbedring i %s epochs.", patience)
+                    logger.info("%sEarly stopping: ingen val-forbedring i %s epochs.", log_prefix, patience)
                     break
             else:
                 logger.info(
-                    "Epoch %s/%s train_mse=%.6f (ingen val — ingen early stopping)",
+                    "%sEpoch %s/%s train_mse=%.6f (ingen val — ingen early stopping)",
+                    log_prefix,
                     epoch + 1,
-                    cfg.EPOCHS,
+                    epochs,
                     train_loss,
                 )
         except KeyboardInterrupt:
@@ -497,6 +422,123 @@ def train_model() -> None:
     if best_state is not None:
         _unwrap_model(model).load_state_dict(best_state)
 
+    return model, best_val, best_state is not None, training_interrupted
+
+
+def train_model() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    random.seed(config.RANDOM_SEED)
+    np.random.seed(config.RANDOM_SEED)
+    torch.manual_seed(config.RANDOM_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config.RANDOM_SEED)
+
+    cfg = config
+
+    calendar_days = int(cfg.TRAINING_YEARS * 366 + cfg.FETCH_EXTRA_DAYS)
+
+    # prefer_cache_only=False: tjek Alpaca for nye barer og opdatér cachen før træning;
+    # falder tilbage til (evt. forældet) cache hvis API mangler nøgler eller fejler.
+    fetch_result = fetch_daily_bars(
+        cfg.ALPACA_API_KEY,
+        cfg.ALPACA_SECRET_KEY,
+        cfg.WATCHLIST,
+        end=None,
+        lookback_calendar_days=calendar_days,
+        extra_buffer_days=0,
+        prefer_cache_only=False,
+    )
+    bars = fetch_result.bars
+    if fetch_result.cache_only:
+        logger.info(
+            "Træningsdata kun fra disk-cache (%s symboler; sidste bar %s).",
+            len(bars),
+            fetch_result.required_end,
+        )
+    if not bars:
+        logger.error("Intet historisk data til træning. Afslutter.")
+        return
+
+    # Auto-opdatér nyere nyheds-sentiment (finBERT) ind i bars før features bygges.
+    try:
+        from stock_predictor.news_sentiment import refresh_watchlist
+
+        refresh_watchlist(cfg.ALPACA_API_KEY, cfg.ALPACA_SECRET_KEY, list(bars.keys()), bars)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("News-sentiment refresh sprunget over: %s", exc)
+
+    data_by_sym = _engineer_all(bars, cfg.SEQ_LEN)
+    if not data_by_sym:
+        logger.error("Ingen symboler med nok historik til træning. Afslutter.")
+        return
+    recs = _build_index(data_by_sym, cfg.SEQ_LEN)
+    if not recs:
+        logger.error("Ingen træningssekvenser kunne bygges. Afslutter.")
+        return
+    if len(recs) < 100:
+        logger.warning(
+            "Kun %s observationer til træning — resultat kan være ustabilt.",
+            len(recs),
+        )
+
+    train_recs, val_recs = _time_sort_split(recs, cfg.VAL_RATIO)
+    if not train_recs:
+        logger.error("Tom træningsmængde efter split. Afslutter.")
+        return
+    # Valgfri trænings-stride (kun træningssættet; val beholdes i fuld tæthed).
+    stride = int(getattr(cfg, "TRAIN_WINDOW_STRIDE", 1))
+    if stride > 1:
+        before = len(train_recs)
+        train_recs = _subsample_train_stride(train_recs, stride)
+        logger.info("Trænings-stride=%s: %s → %s vinduer.", stride, before, len(train_recs))
+    # RobustScaler (median/IQR): robust over for de fede haler i log-afkast/volumen-delta.
+    # Fit kun på unikke træningsrækker; skalér derefter hvert symbols matrix én gang.
+    scaler = _fit_scaler(data_by_sym, train_recs, cfg.N_FEATURES)
+    scaled_by_sym = _scale_all(data_by_sym, scaler, cfg.N_FEATURES)
+
+    del data_by_sym  # rå float32-matricer behøves ikke længere
+
+    train_pref = getattr(cfg, "TRAIN_DEVICE", "auto")
+    device = resolve_device(str(train_pref))
+    logger.info("Træningsenhed: %s", device)
+
+    # Disk-baseline (best_val_mse) læses før træning, så vi ved hvad den nye model skal slå.
+    disk_best_val = float("inf")
+    if cfg.MODEL_PATH.is_file():
+        try:
+            prev = torch.load(cfg.MODEL_PATH, map_location=device)
+            if isinstance(prev, dict) and "best_val_mse" in prev:
+                disk_best_val = float(prev["best_val_mse"])
+                prev_n = int(prev["n_features"]) if "n_features" in prev else None
+                # Skift i feature-antal gør disk-tabet usammenligneligt — nulstil baseline
+                # så den nye arkitektur kan gemmes.
+                if prev_n is not None and prev_n != int(cfg.N_FEATURES):
+                    disk_best_val = float("inf")
+                    logger.warning(
+                        "Checkpoint på disk har n_features=%s men config har %s — "
+                        "behandler som ingen baseline (ny model gemmes hvis val OK).",
+                        prev_n, cfg.N_FEATURES,
+                    )
+                else:
+                    logger.info(
+                        "Eksisterende checkpoint: best_val_mse=%.6f (ny model skal slå dette for at gemmes).",
+                        disk_best_val,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Kunne ikke læse tidligere checkpoint: %s", exc)
+
+    # Selve træningsloopet er udskilt til _fit_lstm (genbruges af CPCV-backtesten).
+    has_val = bool(val_recs)
+    model, best_val, had_best, training_interrupted = _fit_lstm(
+        scaled_by_sym,
+        train_recs,
+        val_recs,
+        device=device,
+        seq_len=cfg.SEQ_LEN,
+        n_features=cfg.N_FEATURES,
+    )
+
     cfg.MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
     save_dict = {
@@ -506,18 +548,18 @@ def train_model() -> None:
         "hidden": config.LSTM_HIDDEN,
         "layers": config.LSTM_LAYERS,
         "dropout": config.DROPOUT,
-        "best_val_mse": float(best_val) if best_state is not None else float("inf"),
+        "best_val_mse": float(best_val) if had_best else float("inf"),
     }
 
     only_if_better = bool(getattr(cfg, "SAVE_MODEL_ONLY_IF_BETTER_THAN_DISK", True))
-    if val_ds is None:
+    if not has_val:
         only_if_better = False
 
     if training_interrupted:
         should_save = False
-        if val_ds is None:
+        if not has_val:
             logger.warning("Ctrl+C: ingen val-split — gemmer ikke.")
-        elif best_state is None:
+        elif not had_best:
             logger.warning("Ctrl+C: intet bedste val-state endnu — gemmer ikke.")
         elif save_dict["best_val_mse"] < disk_best_val - 1e-12:
             should_save = True
@@ -529,10 +571,10 @@ def train_model() -> None:
             )
     else:
         should_save = True
-        if val_ds is not None and best_state is None:
+        if has_val and not had_best:
             should_save = False
             logger.error("Intet valideret bedste state — gemmer ikke (træning afbrudt eller ingen val?).")
-        elif val_ds is not None and only_if_better and best_state is not None:
+        elif has_val and only_if_better and had_best:
             should_save = save_dict["best_val_mse"] < disk_best_val - 1e-12
             if not should_save:
                 logger.warning(
